@@ -14,7 +14,7 @@ ACADEMIC_SESSION = "2026-27"
 PASSWORD_ITERATIONS = 310_000
 DEMO_DATA_TABLES = (
     "employees", "buses", "class_sections", "students", "teacher_assignments",
-    "attendance", "fees", "fee_payments", "classrooms", "smart_boards",
+    "attendance", "fees", "fee_payments", "fee_adjustments", "classrooms", "smart_boards",
     "board_maintenance", "technical_issues", "announcements",
     "announcement_reads", "examinations",
 )
@@ -116,6 +116,34 @@ CREATE TABLE IF NOT EXISTS fee_payments (
     receipt_number TEXT NOT NULL,
     is_demo INTEGER NOT NULL DEFAULT 0 CHECK (is_demo IN (0, 1))
 );
+CREATE TABLE IF NOT EXISTS student_guardian_details (
+    student_id TEXT PRIMARY KEY REFERENCES students(student_id),
+    father_name TEXT NOT NULL DEFAULT '',
+    mother_name TEXT NOT NULL DEFAULT '',
+    emergency_contact TEXT NOT NULL DEFAULT '',
+    is_demo INTEGER NOT NULL DEFAULT 0 CHECK (is_demo IN (0, 1))
+);
+CREATE TABLE IF NOT EXISTS fee_payment_remarks (
+    payment_id TEXT PRIMARY KEY REFERENCES fee_payments(payment_id),
+    remarks TEXT NOT NULL DEFAULT '',
+    is_demo INTEGER NOT NULL DEFAULT 0 CHECK (is_demo IN (0, 1))
+);
+CREATE TABLE IF NOT EXISTS fee_bases (
+    fee_id TEXT PRIMARY KEY REFERENCES fees(fee_id),
+    fee_base_total INTEGER NOT NULL,
+    is_demo INTEGER NOT NULL DEFAULT 0 CHECK (is_demo IN (0, 1)),
+    CHECK (fee_base_total >= 1)
+);
+CREATE TABLE IF NOT EXISTS fee_adjustments (
+    adjustment_id TEXT PRIMARY KEY,
+    fee_id TEXT NOT NULL REFERENCES fees(fee_id),
+    adjustment_date TEXT NOT NULL,
+    amount INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    recorded_by TEXT NOT NULL,
+    is_demo INTEGER NOT NULL DEFAULT 0 CHECK (is_demo IN (0, 1)),
+    CHECK (amount <> 0)
+);
 CREATE TABLE IF NOT EXISTS classrooms (
     classroom_id TEXT PRIMARY KEY,
     room_number TEXT NOT NULL,
@@ -184,7 +212,7 @@ CREATE TABLE IF NOT EXISTS announcement_reads (
     announcement_id TEXT NOT NULL REFERENCES announcements(announcement_id),
     user_id TEXT NOT NULL REFERENCES demo_users(user_id),
     read_status TEXT NOT NULL CHECK (read_status IN ('Read', 'Unread')),
-    is_demo INTEGER NOT NULL DEFAULT 1 CHECK (is_demo = 1),
+    is_demo INTEGER NOT NULL DEFAULT 0 CHECK (is_demo IN (0, 1)),
     PRIMARY KEY (announcement_id, user_id)
 );
 CREATE TABLE IF NOT EXISTS examinations (
@@ -215,6 +243,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_bus_registration_scope ON buses(registrati
 CREATE UNIQUE INDEX IF NOT EXISTS idx_student_admission_scope ON students(admission_number,is_demo);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_receipt_scope ON fee_payments(receipt_number,is_demo);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_classroom_room_scope ON classrooms(room_number,is_demo);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_student_admission_global ON students(admission_number COLLATE NOCASE);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_receipt_global ON fee_payments(receipt_number COLLATE NOCASE);
 """
 
 FIRST_NAMES = [
@@ -284,6 +314,27 @@ def _password_record(password: str) -> tuple[str, str, int]:
 
 
 def _ensure_access_schema(db: sqlite3.Connection) -> None:
+    announcement_reads_sql = db.execute(
+        "SELECT sql FROM sqlite_master "
+        "WHERE type='table' AND name='announcement_reads'"
+    ).fetchone()
+    if announcement_reads_sql and "is_demo = 1" in (announcement_reads_sql["sql"] or ""):
+        db.execute("ALTER TABLE announcement_reads RENAME TO announcement_reads_old")
+        db.execute(
+            "CREATE TABLE announcement_reads ("
+            "announcement_id TEXT NOT NULL REFERENCES announcements(announcement_id),"
+            "user_id TEXT NOT NULL REFERENCES demo_users(user_id),"
+            "read_status TEXT NOT NULL CHECK (read_status IN ('Read', 'Unread')), "
+            "is_demo INTEGER NOT NULL DEFAULT 0 CHECK (is_demo IN (0, 1)),"
+            "PRIMARY KEY (announcement_id, user_id))"
+        )
+        db.execute(
+            "INSERT INTO announcement_reads "
+            "(announcement_id,user_id,read_status,is_demo) "
+            "SELECT announcement_id,user_id,read_status,is_demo "
+            "FROM announcement_reads_old"
+        )
+        db.execute("DROP TABLE announcement_reads_old")
     columns = {row["name"] for row in db.execute("PRAGMA table_info(demo_users)")}
     if "employee_id" not in columns:
         db.execute(
@@ -300,6 +351,18 @@ def _ensure_access_schema(db: sqlite3.Connection) -> None:
         db.execute(
             "ALTER TABLE technical_issues ADD COLUMN repair_notes TEXT NOT NULL DEFAULT ''"
         )
+    missing_bases = db.execute(
+        "SELECT f.fee_id,f.annual_total,f.is_demo,"
+        "COALESCE((SELECT SUM(a.amount) FROM fee_adjustments a WHERE a.fee_id=f.fee_id),0) AS adjustments "
+        "FROM fees f LEFT JOIN fee_bases b ON b.fee_id=f.fee_id "
+        "WHERE b.fee_id IS NULL"
+    ).fetchall()
+    db.executemany(
+        "INSERT INTO fee_bases "
+        "(fee_id,fee_base_total,is_demo) VALUES (?,?,?)",
+        [(row["fee_id"], row["annual_total"] - row["adjustments"], row["is_demo"])
+         for row in missing_bases],
+    )
 
 
 def _provision_demo_users(
@@ -382,6 +445,7 @@ def seed_demo(db: sqlite3.Connection, today: date | None = None) -> list[dict[st
     """Seed once when no demo records exist; return any newly generated logins."""
     db.executescript(SCHEMA)
     _ensure_access_schema(db)
+    db.commit()
     credential_output: list[dict[str, str]] = []
     if any(
         db.execute(f"SELECT COUNT(*) FROM {table} WHERE is_demo = 1").fetchone()[0]
@@ -560,6 +624,11 @@ def seed_demo(db: sqlite3.Connection, today: date | None = None) -> list[dict[st
                         ))
         db.executemany("INSERT INTO fees VALUES (?,?,?,?,?,?,?,?,?,?)", fee_rows)
         db.executemany("INSERT INTO fee_payments VALUES (?,?,?,?,?,?,?)", payment_rows)
+        db.executemany(
+            "INSERT INTO fee_bases "
+            "(fee_id,fee_base_total,is_demo) VALUES (?,?,?)",
+            [(row[0], row[4], row[9]) for row in fee_rows],
+        )
 
         classrooms = [(f"demo-room-{i:03}", f"{100 + i:03}", demo_flag) for i in range(1, 66)]
         db.executemany("INSERT INTO classrooms VALUES (?,?,?)", classrooms)
@@ -658,6 +727,7 @@ def reset_demo(db: sqlite3.Connection, today: date | None = None) -> list[dict[s
     """Replace only demo-owned records; real school rows are never targeted."""
     db.executescript(SCHEMA)
     _ensure_access_schema(db)
+    db.commit()
     db.execute("BEGIN")
     try:
         db.execute(
@@ -666,8 +736,10 @@ def reset_demo(db: sqlite3.Connection, today: date | None = None) -> list[dict[s
         db.execute("DELETE FROM parent_children WHERE is_demo=1")
         for table in (
             "announcement_reads", "examinations", "technical_issues",
-            "board_maintenance", "smart_boards", "classrooms", "fee_payments",
-            "fees", "attendance", "teacher_assignments", "students", "announcements",
+            "board_maintenance", "smart_boards", "classrooms",
+            "fee_adjustments", "fee_payment_remarks", "fee_bases", "fee_payments",
+            "fees", "attendance", "student_guardian_details", "teacher_assignments",
+            "students", "announcements",
             "class_sections", "buses", "employees",
         ):
             if table == "announcement_reads":
