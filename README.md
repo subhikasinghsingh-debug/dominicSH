@@ -74,7 +74,8 @@ bus assignment. Fee edits preserve recorded payments and recalculate the balance
 
 Phase 2 operational features include:
 
-- adding and updating attendance records for accessible students;
+- adding attendance records for active, accessible students and updating existing
+  attendance history for accessible students;
 - recording fee payments and recalculating fee balances;
 - updating smart-board status and technical issue workflows;
 - creating announcements and marking visible announcements as read;

@@ -798,8 +798,12 @@ def _student_table(
         for index, value in enumerate(values):
             text = html.escape("" if value is None else str(value))
             if index == 0:
+                demo_badge = (
+                    '<span class="badge demo">DEMO</span> '
+                    if row["is_demo"] else ""
+                )
                 text = (
-                    f'<a href="{html.escape(profile_url)}"><strong>{text}</strong><br>'
+                    f'{demo_badge}<a href="{html.escape(profile_url)}"><strong>{text}</strong><br>'
                     '<span>View profile</span></a>'
                 )
             if text in ("Present", "Online", "Resolved", "Active", "Paid"):
@@ -939,6 +943,148 @@ def _student_form(
         '</button> <a class="button" href="/?page=students" style="background:#fff;color:#174b3a">Cancel</a></p>'
         '</form></section>'
     )
+
+
+def _staff_form(
+    user: sqlite3.Row,
+    employee: sqlite3.Row | None = None,
+) -> str:
+    def value(field: str) -> str:
+        return str(employee[field]) if employee else ""
+
+    action = "/staff/update" if employee else "/staff/add"
+    heading = "Edit staff member" if employee else "Add staff member"
+    employee_id_field = (
+        f'<input type="hidden" name="employee_id" value="{html.escape(value("employee_id"))}">'
+        if employee else ""
+    )
+    category_options = "".join(
+        f'<option value="{category}"'
+        f'{" selected" if (value("category") or "teacher") == category else ""}>'
+        f'{"Teacher" if category == "teacher" else "Non-teaching staff"}</option>'
+        for category in ("teacher", "staff")
+    )
+    status_options = "".join(
+        f'<option value="{status}"'
+        f'{" selected" if (value("status") or "Active") == status else ""}>{status}</option>'
+        for status in ("Active", "Inactive")
+    )
+    employee_id_control = (
+        f'<input type="text" value="{html.escape(value("employee_id"))}" readonly>'
+        if employee else
+        '<input type="text" name="employee_id" required maxlength="40">'
+    )
+    return (
+        f'<section class="panel"><h2>{heading}</h2>'
+        f'<form method="post" action="{action}">'
+        f'<input type="hidden" name="csrf" value="{html.escape(user["csrf_token"])}">'
+        f'{employee_id_field}<div class="grid">'
+        f'<div><label>Employee ID</label>{employee_id_control}</div>'
+        '<div><label>Staff category</label>'
+        f'<select name="category" required>{category_options}</select></div>'
+        '<div><label>Name</label>'
+        f'<input type="text" name="name" required maxlength="120" value="{html.escape(value("name"))}"></div>'
+        '<div><label>Designation</label>'
+        f'<input type="text" name="designation" required maxlength="120" value="{html.escape(value("designation"))}"></div>'
+        '<div><label>Department</label>'
+        f'<input type="text" name="department" required maxlength="120" value="{html.escape(value("department"))}"></div>'
+        '<div><label>Email</label>'
+        f'<input type="email" name="email" required maxlength="120" value="{html.escape(value("email"))}"></div>'
+        '<div><label>Phone</label>'
+        f'<input type="text" name="phone" required maxlength="30" value="{html.escape(value("phone"))}"></div>'
+        '<div><label>Joining date</label>'
+        f'<input type="date" name="joining_date" required value="{html.escape(value("joining_date"))}"></div>'
+        '<div><label>Status</label>'
+        f'<select name="status" required>{status_options}</select></div>'
+        '</div><p><button type="submit">Save staff details</button> '
+        '<a class="button" href="/?page=staff" style="background:#fff;color:#174b3a">Cancel</a>'
+        '</p></form></section>'
+    )
+
+
+def _class_section_form(
+    user: sqlite3.Row,
+    teachers: list[sqlite3.Row],
+    section: sqlite3.Row | None = None,
+) -> str:
+    def value(field: str, default: str = "") -> str:
+        return str(section[field]) if section else default
+
+    action = "/classes/update" if section else "/classes/add"
+    section_id_field = (
+        f'<input type="hidden" name="section_id" value="{html.escape(value("section_id"))}">'
+        if section else ""
+    )
+    teacher_options = "".join(
+        f'<option value="{html.escape(row["employee_id"])}"'
+        f'{" selected" if section and row["employee_id"] == section["homeroom_teacher_id"] else ""}>'
+        f'{html.escape(row["name"])} · {html.escape(row["employee_id"])}'
+        f'{" (inactive)" if row["status"] != "Active" else ""}</option>'
+        for row in teachers
+    )
+    return (
+        f'<section class="panel"><h2>{"Edit class and section" if section else "Create class section"}</h2>'
+        f'<form method="post" action="{action}">'
+        f'<input type="hidden" name="csrf" value="{html.escape(user["csrf_token"])}">'
+        f'{section_id_field}<div class="grid">'
+        '<div><label>Class name</label>'
+        f'<input type="text" name="class_name" required maxlength="80" value="{html.escape(value("class_name"))}"></div>'
+        '<div><label>Section name</label>'
+        f'<input type="text" name="section_name" required maxlength="40" value="{html.escape(value("section_name"))}"></div>'
+        '<div><label>Academic session</label>'
+        f'<input type="text" name="academic_session" required maxlength="20" value="{html.escape(value("academic_session"))}"></div>'
+        '<div><label>Class teacher</label>'
+        f'<select name="homeroom_teacher_id" required><option value="">Select</option>{teacher_options}</select></div>'
+        '</div><p><button type="submit">Save class section</button> '
+        '<a class="button" href="/?page=classes" style="background:#fff;color:#174b3a">Cancel</a>'
+        '</p></form></section>'
+    )
+
+
+def _staff_table(rows: list[sqlite3.Row]) -> str:
+    if not rows:
+        return '<div class="empty">No records available.</div>'
+    headers = [
+        "Name", "Employee ID", "Category", "Designation", "Department",
+        "Subjects", "Assigned classes", "Email", "Phone", "Joined", "Status",
+    ]
+    thead = "".join(f"<th>{html.escape(header)}</th>" for header in headers)
+    body = []
+    for row in rows:
+        values = tuple(row)
+        cells = []
+        for index, value in enumerate(values):
+            text = html.escape("" if value is None else str(value))
+            if index == 0:
+                text = (
+                    f'<a href="/?page=staff&amp;action=profile&amp;'
+                    f'{html.escape(urlencode({"id": row["employee_id"]}))}">{text}</a>'
+                )
+            elif text in {"Active", "Inactive"}:
+                text = f'<span class="status-{text.lower()}">{text}</span>'
+            cells.append(f"<td>{text}</td>")
+        body.append("<tr>" + "".join(cells) + "</tr>")
+    return f'<div class="table-wrap"><table><thead><tr>{thead}</tr></thead><tbody>{"".join(body)}</tbody></table></div>'
+
+
+def _class_table(rows: list[sqlite3.Row]) -> str:
+    if not rows:
+        return '<div class="empty">No records available.</div>'
+    headers = ["Class", "Section", "Academic session", "Homeroom teacher", "Active students", "Manage"]
+    thead = "".join(f"<th>{html.escape(header)}</th>" for header in headers)
+    body = []
+    for row in rows:
+        edit_link = (
+            f'<a href="/?page=classes&amp;action=edit&amp;'
+            f'{html.escape(urlencode({"id": row["section_id"]}))}">Edit</a>'
+        )
+        values = tuple(row)[:5]
+        cells = [f"<td>{html.escape(str(value))}</td>" for value in values]
+        cells.append(f"<td>{edit_link}</td>")
+        if row["is_demo"]:
+            cells[0] = '<td><span class="badge demo">DEMO</span> ' + cells[0][4:]
+        body.append("<tr>" + "".join(cells) + "</tr>")
+    return f'<div class="table-wrap"><table><thead><tr>{thead}</tr></thead><tbody>{"".join(body)}</tbody></table></div>'
 
 
 def _fee_form(
@@ -1190,8 +1336,12 @@ def dashboard(db: sqlite3.Connection, user: sqlite3.Row) -> str:
         return _scoped_dashboard(db, user)
     scalar = lambda sql, params=(): db.execute(sql, params).fetchone()[0]
     students = scalar("SELECT COUNT(*) FROM students")
-    teachers = scalar("SELECT COUNT(*) FROM employees WHERE category='teacher'")
-    staff = scalar("SELECT COUNT(*) FROM employees WHERE category='staff'")
+    teachers = scalar(
+        "SELECT COUNT(*) FROM employees WHERE category='teacher' AND status='Active'"
+    )
+    staff = scalar(
+        "SELECT COUNT(*) FROM employees WHERE category='staff' AND status='Active'"
+    )
     today = datetime.now().date().isoformat()
     attendance = db.execute(
         "SELECT COUNT(*) total, "
@@ -1227,8 +1377,8 @@ def dashboard(db: sqlite3.Connection, user: sqlite3.Row) -> str:
     active_buses = scalar("SELECT COUNT(*) FROM buses WHERE status='Active'")
     cards = [
         ("Students", f"{students:,}", "Enrolled demo students", _module_href("students")),
-        ("Teachers", str(teachers), "Active demo teachers", _module_href("staff", category="teacher")),
-        ("Non-teaching staff", str(staff), "Demo staff members", _module_href("staff", category="staff")),
+        ("Teachers", str(teachers), "Active teachers", _module_href("staff", category="teacher", status="Active")),
+        ("Non-teaching staff", str(staff), "Active non-teaching staff", _module_href("staff", category="staff", status="Active")),
         (f"Present · {attendance_date}", f"{present:,}", "Latest school-day snapshot",
          _module_href("attendance", attendance_date=attendance_date)),
         (f"Absent · {attendance_date}", f"{absent:,}", f"Latest snapshot · Late: {late:,}",
@@ -1298,22 +1448,29 @@ def module_page(db: sqlite3.Connection, page: str, user: sqlite3.Row,
         ),
         "staff": (
             "Teachers and staff", "Teacher assignments, departments, and non-teaching staff.",
-            """SELECT category, name, employee_id, designation, department, subjects,
-            assigned_classes, email, phone, joining_date, status
-            FROM employees WHERE 1=1 ORDER BY category,name""",
-            ["Category", "Name", "Employee ID", "Designation", "Department", "Subjects",
+            """SELECT e.name,e.employee_id,
+            CASE e.category WHEN 'teacher' THEN 'Teacher' ELSE 'Non-teaching staff' END,
+            e.designation,e.department,
+            COALESCE((SELECT GROUP_CONCAT(DISTINCT ta.subject) FROM teacher_assignments ta
+                WHERE ta.employee_id=e.employee_id),''),
+            COALESCE((SELECT GROUP_CONCAT(DISTINCT c.class_name || ' ' || c.section_name)
+                FROM teacher_assignments ta JOIN class_sections c ON c.section_id=ta.section_id
+                WHERE ta.employee_id=e.employee_id),''),
+            e.email,e.phone,e.joining_date,e.status
+            FROM employees e WHERE 1=1 ORDER BY e.category,e.name""",
+            ["Name", "Employee ID", "Category", "Designation", "Department", "Subjects",
              "Assigned classes", "Email", "Phone", "Joined", "Status"],
         ),
         "classes": (
             "Classes and sections", "Database-backed classes, homeroom teachers, and accessible student counts.",
             """SELECT c.class_name,c.section_name,c.academic_session,
-            COALESCE(e.name,'Unassigned'),COUNT(DISTINCT s.student_id),c.section_id
+            COALESCE(e.name,'Unassigned'),COUNT(DISTINCT s.student_id),c.section_id,c.is_demo
             FROM class_sections c
             LEFT JOIN employees e ON e.employee_id=c.homeroom_teacher_id
-            LEFT JOIN students s ON s.section_id=c.section_id
+            LEFT JOIN students s ON s.section_id=c.section_id AND s.status='Active'
             WHERE 1=1
             GROUP BY c.section_id ORDER BY c.class_name,c.section_name""",
-            ["Class", "Section", "Academic session", "Homeroom teacher", "Students"],
+            ["Class", "Section", "Academic session", "Homeroom teacher", "Active students"],
         ),
         "attendance": (
             "Attendance", "Individual daily attendance records for the previous 30 school days.",
@@ -1488,13 +1645,18 @@ def module_page(db: sqlite3.Connection, page: str, user: sqlite3.Row,
         if filter_values["status"]:
             query = _append_query_clause(query, " AND s.status=?")
             scoped_params += (filter_values["status"],)
-        classes = [row[0] for row in db.execute(
-            "SELECT DISTINCT class_name FROM class_sections ORDER BY class_name"
-        )]
+        accessible_sections = db.execute(
+            "SELECT DISTINCT c.class_name,c.section_name "
+            "FROM class_sections c LEFT JOIN students s ON s.section_id=c.section_id "
+            "WHERE " + scope + " ORDER BY c.class_name,c.section_name",
+            student_scope(user, "s", "c")[1],
+        ).fetchall()
+        classes = sorted({row["class_name"] for row in accessible_sections})
+        sections = sorted({row["section_name"] for row in accessible_sections})
         filter_controls = _filter_form(page,
             _filter_control("q", "Student search", filter_values["q"], placeholder="Name, admission no. or class")
             + _filter_control("class_name", "Class", filter_values["class_name"], classes)
-            + _filter_control("section_name", "Section", filter_values["section_name"])
+            + _filter_control("section_name", "Section", filter_values["section_name"], sections)
             + _filter_control("status", "Status", filter_values["status"], ["Active", "Inactive"]))
     elif page == "classes":
         filter_values = {
@@ -1532,20 +1694,26 @@ def module_page(db: sqlite3.Connection, page: str, user: sqlite3.Row,
             "q": params.get("q", [""])[0].strip(),
             "designation": params.get("designation", [""])[0].strip(),
             "category": params.get("category", [""])[0].strip(),
+            "status": params.get("status", [""])[0].strip(),
         }
         if filter_values["category"]:
-            query = _append_query_clause(query, " AND category=?")
+            query = _append_query_clause(
+                query, " AND e.category=?"
+            )
             scoped_params += (filter_values["category"],)
         if filter_values["designation"]:
             query = _append_query_clause(
-                query, " AND designation=?"
+                query, " AND e.designation=?"
             )
             scoped_params += (filter_values["designation"],)
+        if filter_values["status"]:
+            query = _append_query_clause(query, " AND e.status=?")
+            scoped_params += (filter_values["status"],)
         if filter_values["q"]:
             needle = "%" + filter_values["q"].lower() + "%"
             query = _append_query_clause(
                 query,
-                " AND (LOWER(name) LIKE ? OR LOWER(employee_id) LIKE ? OR LOWER(designation) LIKE ?)",
+                " AND (LOWER(e.name) LIKE ? OR LOWER(e.employee_id) LIKE ? OR LOWER(e.designation) LIKE ?)",
             )
             scoped_params += (needle, needle, needle)
         designations = [row[0] for row in db.execute(
@@ -1555,7 +1723,9 @@ def module_page(db: sqlite3.Connection, page: str, user: sqlite3.Row,
             _filter_control("q", "Staff search", filter_values["q"], placeholder="Name, employee ID or designation")
             + _filter_control("designation", "Designation", filter_values["designation"], designations)
             + _filter_control("category", "Staff category", filter_values["category"],
-                              ["teacher", "staff"]))
+                              ["teacher", "staff"])
+            + _filter_control("status", "Status", filter_values["status"],
+                              ["Active", "Inactive"]))
     elif page == "attendance":
         filter_values = {
             "attendance_date": params.get("attendance_date", [""])[0].strip(),
@@ -1827,6 +1997,10 @@ def module_page(db: sqlite3.Connection, page: str, user: sqlite3.Row,
     table = (
         _student_table(headers, fetched_rows)
         if page == "students"
+        else _staff_table(fetched_rows)
+        if page == "staff"
+        else _class_table(fetched_rows)
+        if page == "classes"
         else _table(headers, rows)
     )
     forms = ""
@@ -1880,7 +2054,7 @@ def module_page(db: sqlite3.Connection, page: str, user: sqlite3.Row,
             for row in db.execute(
                 "SELECT s.student_id,s.full_name,c.class_name,c.section_name "
                 "FROM students s JOIN class_sections c ON c.section_id=s.section_id "
-                "WHERE " + scope +
+                "WHERE s.status='Active' AND " + scope +
                 " ORDER BY c.class_name,c.section_name,s.roll_number",
                 params,
             )
@@ -1976,6 +2150,140 @@ def module_page(db: sqlite3.Connection, page: str, user: sqlite3.Row,
             _table(["Room", "Date", "Work performed", "Assigned technician", "Status"],
                    [tuple(row) for row in history]) + "</section>"
         )
+    staff_tools = ""
+    if page == "staff" and user["role"] in ADMIN_ROLES:
+        action = params.get("action", [""])[0]
+        staff_tools = (
+            '<div class="section-head"><h2>Staff administration</h2>'
+            '<a class="button" href="/?page=staff&amp;action=add">Add staff member</a></div>'
+        )
+        if action == "add":
+            staff_tools += _staff_form(user)
+        elif action in {"profile", "edit"}:
+            employee_id = params.get("id", [""])[0]
+            employee = db.execute(
+                "SELECT * FROM employees WHERE employee_id=?", (employee_id,)
+            ).fetchone()
+            if not employee:
+                staff_tools += '<div class="notice">Staff member not found.</div>'
+            elif action == "edit":
+                staff_tools += _staff_form(user, employee)
+            else:
+                profile_items = (
+                    ("Name", employee["name"]),
+                    ("Employee ID", employee["employee_id"]),
+                    ("Category", "Teacher" if employee["category"] == "teacher" else "Non-teaching staff"),
+                    ("Designation", employee["designation"]),
+                    ("Department", employee["department"]),
+                    ("Email", employee["email"]),
+                    ("Phone", employee["phone"]),
+                    ("Joining date", employee["joining_date"]),
+                    ("Status", employee["status"]),
+                )
+                profile = '<div class="profile-grid">' + "".join(
+                    '<div class="profile-item"><strong>' + html.escape(label) +
+                    '</strong><span>' + html.escape(str(value)) + '</span></div>'
+                    for label, value in profile_items
+                ) + '</div>'
+                staff_tools += (
+                    '<section class="panel"><h2>Staff profile</h2>' + profile +
+                    f'<p><a class="button" href="/?page=staff&amp;action=edit&amp;'
+                    f'{html.escape(urlencode({"id": employee_id}))}">Edit profile</a></p>'
+                    '<form method="post" action="/staff/status">'
+                    f'<input type="hidden" name="csrf" value="{html.escape(user["csrf_token"])}">'
+                    f'<input type="hidden" name="employee_id" value="{html.escape(employee_id)}">'
+                    '<label>Staff status <select name="status">'
+                    + "".join(
+                        f'<option value="{status}"'
+                        f'{" selected" if employee["status"] == status else ""}>{status}</option>'
+                        for status in ("Active", "Inactive")
+                    )
+                    + '</select></label> <button type="submit">Update status</button>'
+                    '</form></section>'
+                )
+                if employee["category"] == "teacher":
+                    assignments = db.execute(
+                        "SELECT ta.assignment_id,ta.subject,c.class_name,c.section_name "
+                        "FROM teacher_assignments ta JOIN class_sections c "
+                        "ON c.section_id=ta.section_id WHERE ta.employee_id=? "
+                        "ORDER BY c.class_name,c.section_name,ta.subject",
+                        (employee_id,),
+                    ).fetchall()
+                    assignment_rows = []
+                    for assignment in assignments:
+                        remove_form = (
+                            '<form method="post" action="/staff/assignments/remove">'
+                            f'<input type="hidden" name="csrf" value="{html.escape(user["csrf_token"])}">'
+                            f'<input type="hidden" name="employee_id" value="{html.escape(employee_id)}">'
+                            f'<input type="hidden" name="assignment_id" value="{html.escape(assignment["assignment_id"])}">'
+                            '<button class="danger" type="submit">Remove</button></form>'
+                        )
+                        assignment_rows.append((
+                            assignment["class_name"], assignment["section_name"],
+                            assignment["subject"], remove_form,
+                        ))
+                    assignment_table = (
+                        '<div class="table-wrap"><table><thead><tr><th>Class</th><th>Section</th>'
+                        '<th>Subject</th><th>Action</th></tr></thead><tbody>' +
+                        "".join(
+                            "<tr>" + "".join(
+                                f"<td>{value if index == 3 else html.escape(str(value))}</td>"
+                                for index, value in enumerate(row)
+                            ) + "</tr>"
+                            for row in assignment_rows
+                        ) + '</tbody></table></div>'
+                        if assignments else '<div class="empty">No teaching assignments.</div>'
+                    )
+                    sections = db.execute(
+                        "SELECT section_id,class_name,section_name,academic_session "
+                        "FROM class_sections ORDER BY class_name,section_name,academic_session"
+                    ).fetchall()
+                    section_options = "".join(
+                        f'<option value="{html.escape(row["section_id"])}">'
+                        f'{html.escape(row["class_name"])} · {html.escape(row["section_name"])} '
+                        f'({html.escape(row["academic_session"])})</option>'
+                        for row in sections
+                    )
+                    staff_tools += (
+                        '<section class="panel"><h2>Teacher assignments</h2>'
+                        + assignment_table +
+                        '<form method="post" action="/staff/assignments/add">'
+                        f'<input type="hidden" name="csrf" value="{html.escape(user["csrf_token"])}">'
+                        f'<input type="hidden" name="employee_id" value="{html.escape(employee_id)}">'
+                        '<div class="grid"><div><label>Class and section</label>'
+                        f'<select name="section_id" required><option value="">Select</option>{section_options}</select></div>'
+                        '<div><label>Subject</label><input name="subject" required maxlength="80"></div>'
+                        '</div><p><button type="submit">Assign teacher</button></p></form></section>'
+                    )
+    class_tools = ""
+    if page == "classes" and user["role"] in ADMIN_ROLES:
+        action = params.get("action", [""])[0]
+        class_tools = (
+            '<div class="section-head"><h2>Class and section administration</h2>'
+            '<a class="button" href="/?page=classes&amp;action=add">Create class section</a></div>'
+        )
+        if action == "add":
+            teachers = db.execute(
+                "SELECT employee_id,name,status FROM employees "
+                "WHERE category='teacher' AND status='Active' ORDER BY name"
+            ).fetchall()
+            class_tools += _class_section_form(user, teachers)
+        elif action == "edit":
+            section_id = params.get("id", [""])[0]
+            section = db.execute(
+                "SELECT section_id,class_name,section_name,academic_session,homeroom_teacher_id "
+                "FROM class_sections WHERE section_id=?", (section_id,)
+            ).fetchone()
+            if not section:
+                class_tools += '<div class="notice">Class section not found.</div>'
+            else:
+                teachers = db.execute(
+                    "SELECT employee_id,name,status FROM employees "
+                    "WHERE category='teacher' AND (status='Active' OR employee_id=?) "
+                    "ORDER BY name",
+                    (section["homeroom_teacher_id"],),
+                ).fetchall()
+                class_tools += _class_section_form(user, teachers, section)
     student_tools = ""
     if page == "students" and user["role"] in ADMIN_ROLES:
         action = params.get("action", [""])[0]
@@ -2048,7 +2356,8 @@ def module_page(db: sqlite3.Connection, page: str, user: sqlite3.Row,
         export_link = '<p><a class="button" href="/export/payments">Export payments CSV</a></p>'
     return (
         f'<main><h1>{heading}</h1><p class="sub">{description} · {len(rows):,} displayed records.</p>'
-        f'{filter_controls}{export_link}{student_tools}{table}{section_roster_actions}{forms}{maintenance}</main>'
+        f'{filter_controls}{export_link}{staff_tools}{class_tools}{student_tools}{table}'
+        f'{section_roster_actions}{forms}{maintenance}</main>'
     )
 
 
@@ -2573,7 +2882,15 @@ class SchoolHandler(BaseHTTPRequestHandler):
                     1,
                 )
             reset_notice = '<div class="notice">Demo records have been safely reset and reseeded. Demo logins were retained.</div>' if params.get("reset") == ["1"] else ""
-            if params.get("added") == ["1"]:
+            if params.get("staff_saved") == ["1"]:
+                reset_notice += '<div class="notice">Staff details saved successfully.</div>'
+            elif params.get("staff_status") == ["1"]:
+                reset_notice += '<div class="notice">Staff status updated successfully.</div>'
+            elif params.get("assignment_saved") == ["1"]:
+                reset_notice += '<div class="notice">Teacher assignment updated successfully.</div>'
+            elif params.get("class_saved") == ["1"]:
+                reset_notice += '<div class="notice">Class section saved successfully.</div>'
+            elif params.get("added") == ["1"]:
                 reset_notice += '<div class="notice">Student added successfully.</div>'
             elif params.get("edited") == ["1"]:
                 reset_notice += '<div class="notice">Student information updated successfully.</div>'
@@ -2607,7 +2924,7 @@ Type <strong>RESET DEMO DATA</strong> to confirm. Your demo login will be retain
 <a class="button" href="/credentials">Configure account credentials</a></section>"""
             if page == "dashboard":
                 content = content.replace("</main>", reset_notice + reset_panel + "</main>")
-            elif page in ("students", "student") and reset_notice:
+            elif page in ("students", "student", "staff", "classes") and reset_notice:
                 content = content.replace("<main>", "<main>" + reset_notice, 1)
             page_title = (
                 "Dashboard" if page == "dashboard" else
@@ -2815,7 +3132,7 @@ Type <strong>RESET DEMO DATA</strong> to confirm. Your demo login will be retain
             scope, params = student_scope(user, "s", "c")
             with database_connection(self.database) as db:
                 accessible = db.execute(
-                    "SELECT s.student_id FROM students s "
+                    "SELECT s.student_id,s.status FROM students s "
                     "JOIN class_sections c ON c.section_id=s.section_id "
                     "WHERE s.student_id=? AND " + scope,
                     (student_id, *params),
@@ -2828,6 +3145,13 @@ Type <strong>RESET DEMO DATA</strong> to confirm. Your demo login will be retain
                     "WHERE student_id=? AND attendance_date=?",
                     (student_id, attendance_date),
                 ).fetchone()
+                if not existing and accessible["status"] != "Active":
+                    self.send_html(
+                        "<main><h1>Inactive student</h1>"
+                        "<p>New attendance cannot be recorded for an inactive student.</p></main>",
+                        403,
+                    )
+                    return
                 if existing:
                     db.execute(
                         "UPDATE attendance SET status=? WHERE student_id=? AND attendance_date=?",
@@ -3045,6 +3369,258 @@ Type <strong>RESET DEMO DATA</strong> to confirm. Your demo login will be retain
                 )
             self.redirect("/?page=issues")
             return
+        if self.path in {
+            "/staff/add", "/staff/update", "/staff/status",
+            "/staff/assignments/add", "/staff/assignments/remove",
+            "/classes/add", "/classes/update",
+        }:
+            if user["role"] not in ADMIN_ROLES:
+                self.send_html(
+                    _page_start("Not authorized", "", user) +
+                    "<main><h1>Not authorized</h1><p>Only the Director or Principal can manage staff and class records.</p></main>" +
+                    _page_end(), 403,
+                )
+                return
+
+            if self.path == "/staff/status":
+                employee_id = form.get("employee_id", [""])[0].strip()
+                status = form.get("status", [""])[0].strip()
+                if not employee_id or status not in {"Active", "Inactive"}:
+                    self.send_html("<main><h1>Invalid staff status</h1></main>", 400)
+                    return
+                with database_connection(self.database) as db:
+                    result = db.execute(
+                        "UPDATE employees SET status=? WHERE employee_id=?",
+                        (status, employee_id),
+                    )
+                    if result.rowcount != 1:
+                        self.send_html("<main><h1>Staff member not found</h1></main>", 404)
+                        return
+                self.redirect(
+                    "/?page=staff&action=profile&" +
+                    urlencode({"id": employee_id}) + "&staff_status=1"
+                )
+                return
+
+            if self.path in {"/staff/assignments/add", "/staff/assignments/remove"}:
+                employee_id = form.get("employee_id", [""])[0].strip()
+                with database_connection(self.database) as db:
+                    employee = db.execute(
+                        "SELECT category,status FROM employees WHERE employee_id=?",
+                        (employee_id,),
+                    ).fetchone()
+                    if not employee or employee["category"] != "teacher":
+                        self.send_html("<main><h1>Teacher not found</h1></main>", 404)
+                        return
+                    if self.path == "/staff/assignments/remove":
+                        assignment_id = form.get("assignment_id", [""])[0].strip()
+                        result = db.execute(
+                            "DELETE FROM teacher_assignments "
+                            "WHERE assignment_id=? AND employee_id=?",
+                            (assignment_id, employee_id),
+                        )
+                        if result.rowcount != 1:
+                            self.send_html("<main><h1>Teacher assignment not found</h1></main>", 404)
+                            return
+                    else:
+                        section_id = form.get("section_id", [""])[0].strip()
+                        subject = form.get("subject", [""])[0].strip()
+                        if (
+                            employee["status"] != "Active" or not section_id or
+                            not subject or len(subject) > 80 or
+                            any(ord(character) < 32 for character in subject)
+                        ):
+                            self.send_html("<main><h1>Invalid teacher assignment</h1></main>", 400)
+                            return
+                        section = db.execute(
+                            "SELECT 1 FROM class_sections WHERE section_id=?",
+                            (section_id,),
+                        ).fetchone()
+                        if not section:
+                            self.send_html("<main><h1>Class section not found</h1></main>", 404)
+                            return
+                        duplicate = db.execute(
+                            "SELECT 1 FROM teacher_assignments "
+                            "WHERE employee_id=? AND section_id=? AND subject=?",
+                            (employee_id, section_id, subject),
+                        ).fetchone()
+                        if duplicate:
+                            self.send_html("<main><h1>Teacher assignment already exists</h1></main>", 409)
+                            return
+                        try:
+                            db.execute(
+                                "INSERT INTO teacher_assignments "
+                                "(assignment_id,employee_id,section_id,subject,is_demo) "
+                                "VALUES (?,?,?,?,0)",
+                                ("assignment-" + secrets.token_hex(12),
+                                 employee_id, section_id, subject),
+                            )
+                        except sqlite3.IntegrityError:
+                            self.send_html("<main><h1>Teacher assignment already exists</h1></main>", 409)
+                            return
+                self.redirect(
+                    "/?page=staff&action=profile&" +
+                    urlencode({"id": employee_id}) + "&assignment_saved=1"
+                )
+                return
+
+            if self.path in {"/staff/add", "/staff/update"}:
+                employee_id = form.get("employee_id", [""])[0].strip()
+                category = form.get("category", [""])[0].strip()
+                name = form.get("name", [""])[0].strip()
+                designation = form.get("designation", [""])[0].strip()
+                department = form.get("department", [""])[0].strip()
+                email = form.get("email", [""])[0].strip()
+                phone = form.get("phone", [""])[0].strip()
+                joining_date = form.get("joining_date", [""])[0].strip()
+                status = form.get("status", [""])[0].strip()
+                try:
+                    parsed_joining_date = date.fromisoformat(joining_date)
+                except ValueError:
+                    parsed_joining_date = None
+                if (
+                    not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,39}", employee_id) or
+                    category not in {"teacher", "staff"} or
+                    not all((name, designation, department, email, phone)) or
+                    any(len(value) > limit for value, limit in (
+                        (name, 120), (designation, 120), (department, 120),
+                        (email, 120), (phone, 30),
+                    )) or
+                    not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email) or
+                    not re.fullmatch(r"[0-9+().\-\s]{6,30}", phone) or
+                    parsed_joining_date is None or
+                    status not in {"Active", "Inactive"}
+                ):
+                    self.send_html("<main><h1>Invalid staff details</h1><p>Complete all required fields using a valid employee ID, email, phone, and joining date.</p></main>", 400)
+                    return
+                try:
+                    with database_connection(self.database) as db:
+                        existing = None
+                        if self.path == "/staff/update":
+                            existing = db.execute(
+                                "SELECT employee_id,category FROM employees WHERE employee_id=?",
+                                (employee_id,),
+                            ).fetchone()
+                            if not existing:
+                                self.send_html("<main><h1>Staff member not found</h1></main>", 404)
+                                return
+                            if existing["category"] == "teacher" and category != "teacher":
+                                assigned = db.execute(
+                                    "SELECT 1 FROM teacher_assignments WHERE employee_id=? "
+                                    "UNION SELECT 1 FROM class_sections WHERE homeroom_teacher_id=? LIMIT 1",
+                                    (employee_id, employee_id),
+                                ).fetchone()
+                                if assigned:
+                                    self.send_html(
+                                        "<main><h1>Teacher category cannot be changed</h1>"
+                                        "<p>Remove the teacher's class and subject assignments first.</p></main>",
+                                        400,
+                                    )
+                                    return
+                        duplicate = db.execute(
+                            "SELECT employee_id FROM employees "
+                            "WHERE LOWER(employee_id)=LOWER(?) "
+                            + ("AND employee_id<>?" if existing else ""),
+                            (employee_id, employee_id) if existing else (employee_id,),
+                        ).fetchone()
+                        if duplicate:
+                            self.send_html("<main><h1>Duplicate employee ID</h1></main>", 409)
+                            return
+                        if existing:
+                            db.execute(
+                                "UPDATE employees SET category=?,name=?,designation=?,department=?,"
+                                "email=?,phone=?,joining_date=?,status=? WHERE employee_id=?",
+                                (category, name, designation, department, email, phone,
+                                 joining_date, status, employee_id),
+                            )
+                        else:
+                            db.execute(
+                                "INSERT INTO employees "
+                                "(employee_id,category,name,designation,department,email,phone,"
+                                "joining_date,status,is_demo) VALUES (?,?,?,?,?,?,?,?,?,0)",
+                                (employee_id, category, name, designation, department,
+                                 email, phone, joining_date, status),
+                            )
+                except sqlite3.IntegrityError:
+                    self.send_html("<main><h1>Duplicate employee ID</h1></main>", 409)
+                    return
+                self.redirect(
+                    "/?page=staff&action=profile&" +
+                    urlencode({"id": employee_id}) + "&staff_saved=1"
+                )
+                return
+
+            section_id = form.get("section_id", [""])[0].strip()
+            class_name = re.sub(r"\s+", " ", form.get("class_name", [""])[0].strip())
+            section_name = re.sub(r"\s+", " ", form.get("section_name", [""])[0].strip())
+            academic_session = form.get("academic_session", [""])[0].strip()
+            teacher_id = form.get("homeroom_teacher_id", [""])[0].strip()
+            if (
+                not class_name or len(class_name) > 80 or
+                not section_name or len(section_name) > 40 or
+                not academic_session or len(academic_session) > 20 or
+                any(ord(character) < 32 for character in class_name + section_name + academic_session) or
+                not teacher_id
+            ):
+                self.send_html("<main><h1>Invalid class section</h1><p>Class, section, session, and class teacher are required.</p></main>", 400)
+                return
+            with database_connection(self.database) as db:
+                teacher = db.execute(
+                    "SELECT category,status FROM employees WHERE employee_id=?",
+                    (teacher_id,),
+                ).fetchone()
+                existing_section = None
+                if self.path == "/classes/update":
+                    existing_section = db.execute(
+                        "SELECT section_id,homeroom_teacher_id FROM class_sections "
+                        "WHERE section_id=?",
+                        (section_id,),
+                    ).fetchone()
+                    if not existing_section:
+                        self.send_html("<main><h1>Class section not found</h1></main>", 404)
+                        return
+                retained_inactive_teacher = bool(
+                    existing_section and
+                    existing_section["homeroom_teacher_id"] == teacher_id
+                )
+                if (
+                    not teacher or teacher["category"] != "teacher" or
+                    (teacher["status"] != "Active" and not retained_inactive_teacher)
+                ):
+                    self.send_html("<main><h1>Choose an active teacher</h1></main>", 400)
+                    return
+                duplicate = db.execute(
+                    "SELECT section_id FROM class_sections "
+                    "WHERE class_name=? COLLATE NOCASE "
+                    "AND section_name=? COLLATE NOCASE "
+                    "AND academic_session=? COLLATE NOCASE "
+                    + ("AND section_id<>?" if existing_section else ""),
+                    (class_name, section_name, academic_session, section_id)
+                    if existing_section else (class_name, section_name, academic_session),
+                ).fetchone()
+                if duplicate:
+                    self.send_html("<main><h1>Duplicate class and section</h1><p>This section already exists for the selected academic session.</p></main>", 409)
+                    return
+                try:
+                    if existing_section:
+                        db.execute(
+                            "UPDATE class_sections SET class_name=?,section_name=?,"
+                            "academic_session=?,homeroom_teacher_id=? WHERE section_id=?",
+                            (class_name, section_name, academic_session, teacher_id, section_id),
+                        )
+                    else:
+                        section_id = "section-" + secrets.token_hex(12)
+                        db.execute(
+                            "INSERT INTO class_sections "
+                            "(section_id,class_name,section_name,academic_session,"
+                            "homeroom_teacher_id,is_demo) VALUES (?,?,?,?,?,0)",
+                            (section_id, class_name, section_name, academic_session, teacher_id),
+                        )
+                except sqlite3.IntegrityError:
+                    self.send_html("<main><h1>Duplicate class and section</h1></main>", 409)
+                    return
+            self.redirect("/?page=classes&class_saved=1")
+            return
         if self.path in ("/students/add", "/students/update", "/students/deactivate"):
             if user["role"] not in ADMIN_ROLES:
                 self.send_html(
@@ -3247,7 +3823,7 @@ Type <strong>RESET DEMO DATA</strong> to confirm. Your demo login will be retain
                          roll_number, section["academic_session"], guardian_name, guardian_phone,
                          guardian_email, address,
                          admission_date or date.today().isoformat(),
-                         bus_id or None, "Active", 0),
+                         bus_id or None, student_status or "Active", 0),
                     )
                     db.execute(
                         "INSERT INTO student_guardian_details "

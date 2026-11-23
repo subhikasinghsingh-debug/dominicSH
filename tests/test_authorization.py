@@ -1,5 +1,6 @@
 import os
 import re
+import secrets
 import tempfile
 import threading
 import unittest
@@ -676,6 +677,9 @@ class AuthorizationTests(unittest.TestCase):
             self.assertIsNotNone(student)
             student_id = student["student_id"]
             self.assertEqual(student["is_demo"], 0)
+            status, attendance_page = self.request("Director", "/?page=attendance")
+            self.assertEqual(status, 200)
+            self.assertIn(f'value="{student_id}"', attendance_page)
             db.execute(
                 "INSERT INTO attendance VALUES (?,?,?,?,0)",
                 ("phase1-attendance-1", student_id, "2026-11-19", "Present"),
@@ -704,6 +708,44 @@ class AuthorizationTests(unittest.TestCase):
             "Phase One Edited",
             self.request("Director", "/?page=students&q=Phase+One")[1],
         )
+        status, by_admission_number = self.request(
+            "Director", "/?page=students&q=SC-PHASE1-001"
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("Phase One Edited", by_admission_number)
+        status, by_class_and_section = self.request(
+            "Director",
+            "/?page=students&class_name=Class+I&section_name=A&status=Active",
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("Phase One Edited", by_class_and_section)
+        status, demo_student = self.request("Director", "/?page=students&q=Aarav")
+        self.assertEqual(status, 200)
+        self.assertIn('class="badge demo">DEMO</span>', demo_student)
+
+        inactive_values = {
+            **values,
+            "admission_number": "SC-PHASE1-INACTIVE",
+            "full_name": "Inactive Phase One Student",
+            "roll_number": "78",
+            "status": "Inactive",
+        }
+        status, _ = self.request("Director", "/students/add", inactive_values)
+        self.assertEqual(status, 200)
+        inactive_student_id = self.db_value(
+            "SELECT student_id FROM students WHERE admission_number=?",
+            ("SC-PHASE1-INACTIVE",),
+        )
+        self.assertEqual(
+            self.db_value(
+                "SELECT status FROM students WHERE student_id=?",
+                (inactive_student_id,),
+            ),
+            "Inactive",
+        )
+        status, attendance_page = self.request("Director", "/?page=attendance")
+        self.assertEqual(status, 200)
+        self.assertNotIn(f'value="{inactive_student_id}"', attendance_page)
 
         duplicate_values = {
             **values,
@@ -767,6 +809,35 @@ class AuthorizationTests(unittest.TestCase):
             edit_values,
         )
         self.assertEqual(status, 403)
+
+    def test_inactive_students_are_not_available_for_attendance(self):
+        db = connect(self.database)
+        db.execute(
+            "UPDATE students SET status='Inactive' WHERE student_id='demo-student-0001'"
+        )
+        db.commit()
+        db.close()
+        try:
+            status, attendance_page = self.request("Director", "/?page=attendance")
+            self.assertEqual(status, 200)
+            self.assertNotIn('value="demo-student-0001"', attendance_page)
+            status, _ = self.request(
+                "Director",
+                "/attendance/update",
+                {
+                    "student_id": "demo-student-0001",
+                    "attendance_date": "2099-01-01",
+                    "status": "Present",
+                },
+            )
+            self.assertEqual(status, 403)
+        finally:
+            db = connect(self.database)
+            db.execute(
+                "UPDATE students SET status='Active' WHERE student_id='demo-student-0001'"
+            )
+            db.commit()
+            db.close()
 
     def test_existing_student_profile_edits_fees_transport_and_payment_history(self):
         db = connect(self.database)
@@ -1240,6 +1311,235 @@ class AuthorizationTests(unittest.TestCase):
                           "attendance_date": "2026-11-18", "status": "Absent"})[0],
             403,
         )
+
+    def test_staff_management_persists_profiles_assignments_and_status(self):
+        employee_id = "sprint2-" + secrets.token_hex(5)
+        name = "Sprint Two Teacher"
+        values = {
+            "employee_id": employee_id,
+            "category": "teacher",
+            "name": name,
+            "designation": "Class Teacher",
+            "department": "Primary",
+            "email": f"{employee_id}@example.test",
+            "phone": "+91-90000-12345",
+            "joining_date": "2024-06-01",
+            "status": "Active",
+        }
+        status, _ = self.request("Director", "/staff/add", values)
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            self.db_value(
+                "SELECT category || ':' || name FROM employees WHERE employee_id=?",
+                (employee_id,),
+            ),
+            "teacher:" + name,
+        )
+        self.assertEqual(
+            self.request("Director", "/staff/add", values)[0], 409
+        )
+
+        assignment_values = {
+            "employee_id": employee_id,
+            "section_id": "demo-section-01-A",
+            "subject": "Sprint Two Subject",
+        }
+        self.assertEqual(
+            self.request("Director", "/staff/assignments/add", assignment_values)[0],
+            200,
+        )
+        self.assertEqual(
+            self.db_value(
+                "SELECT COUNT(*) FROM teacher_assignments "
+                "WHERE employee_id=? AND section_id=? AND subject=? AND is_demo=0",
+                (employee_id, "demo-section-01-A", "Sprint Two Subject"),
+            ),
+            1,
+        )
+        status, profile = self.request(
+            "Director", f"/?page=staff&action=profile&id={employee_id}"
+        )
+        self.assertEqual(status, 200)
+        self.assertIn(name, profile)
+        self.assertIn("Sprint Two Subject", profile)
+
+        edited = {**values, "name": "Sprint Two Edited", "department": "Languages"}
+        self.assertEqual(
+            self.request("Director", "/staff/update", edited)[0], 200
+        )
+        self.assertEqual(
+            self.db_value(
+                "SELECT name || ':' || department FROM employees WHERE employee_id=?",
+                (employee_id,),
+            ),
+            "Sprint Two Edited:Languages",
+        )
+        for staff_status in ("Inactive", "Active"):
+            self.assertEqual(
+                self.request(
+                    "Director", "/staff/status",
+                    {"employee_id": employee_id, "status": staff_status},
+                )[0],
+                200,
+            )
+            self.assertEqual(
+                self.db_value(
+                    "SELECT status FROM employees WHERE employee_id=?",
+                    (employee_id,),
+                ),
+                staff_status,
+            )
+
+        non_teacher_id = "sprint2-" + secrets.token_hex(5)
+        non_teacher = {
+            **values,
+            "employee_id": non_teacher_id,
+            "category": "staff",
+            "name": "Sprint Two Office Staff",
+            "designation": "Office Administrator",
+            "department": "Administration",
+            "email": f"{non_teacher_id}@example.test",
+        }
+        self.assertEqual(
+            self.request("Director", "/staff/add", non_teacher)[0], 200
+        )
+        status, filtered_staff = self.request(
+            "Director",
+            f"/?page=staff&q={non_teacher_id}&category=staff&status=Active",
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("Sprint Two Office Staff", filtered_staff)
+        self.assertNotIn("demo-teacher-001", filtered_staff)
+
+    def test_class_section_creation_editing_assignment_and_live_counts(self):
+        class_name = "Sprint Two " + secrets.token_hex(4)
+        session = "2099-2100"
+        teacher_id = "demo-teacher-001"
+        values = {
+            "class_name": class_name,
+            "section_name": "A",
+            "academic_session": session,
+            "homeroom_teacher_id": teacher_id,
+        }
+        self.assertEqual(self.request("Director", "/classes/add", values)[0], 200)
+        section_id = self.db_value(
+            "SELECT section_id FROM class_sections "
+            "WHERE class_name=? AND section_name='A' AND academic_session=?",
+            (class_name, session),
+        )
+        self.assertEqual(
+            self.db_value(
+                "SELECT homeroom_teacher_id FROM class_sections WHERE section_id=?",
+                (section_id,),
+            ),
+            teacher_id,
+        )
+
+        second_section = {**values, "section_name": "B", "homeroom_teacher_id": "demo-teacher-002"}
+        self.assertEqual(
+            self.request("Director", "/classes/add", second_section)[0], 200
+        )
+        duplicate = {
+            **values,
+            "class_name": class_name.lower(),
+            "section_name": "a",
+        }
+        self.assertEqual(self.request("Director", "/classes/add", duplicate)[0], 409)
+
+        edited_name = class_name + " Revised"
+        edited = {
+            **values,
+            "section_id": section_id,
+            "class_name": edited_name,
+            "homeroom_teacher_id": "demo-teacher-002",
+        }
+        self.assertEqual(self.request("Director", "/classes/update", edited)[0], 200)
+        self.assertEqual(
+            self.db_value(
+                "SELECT homeroom_teacher_id FROM class_sections WHERE section_id=?",
+                (section_id,),
+            ),
+            "demo-teacher-002",
+        )
+
+        db = connect(self.database)
+        db.execute(
+            "INSERT INTO students VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)",
+            (
+                "sprint2-student-" + secrets.token_hex(4),
+                "SC-SPRINT2-" + secrets.token_hex(4),
+                "Sprint Two Count Student",
+                "2015-01-01",
+                "Other",
+                section_id,
+                1,
+                session,
+                "Guardian",
+                "+91-90000-00000",
+                "guardian@example.test",
+                "Test address",
+                "2099-01-01",
+                None,
+                "Active",
+            ),
+        )
+        db.commit()
+        db.close()
+        status, class_page = self.request(
+            "Director",
+            f"/?page=classes&class_name={edited_name.replace(' ', '+')}&section_name=A",
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("<td>1</td>", class_page)
+        db = connect(self.database)
+        db.execute(
+            "UPDATE students SET status='Inactive' WHERE section_id=?",
+            (section_id,),
+        )
+        db.commit()
+        db.close()
+        status, class_page = self.request(
+            "Director",
+            f"/?page=classes&class_name={edited_name.replace(' ', '+')}&section_name=A",
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("<td>0</td>", class_page)
+
+    def test_staff_and_class_administration_is_role_restricted(self):
+        for role in ("Director", "Principal"):
+            with self.subTest(role=role):
+                self.assertEqual(self.request(role, "/?page=staff")[0], 200)
+                self.assertEqual(self.request(role, "/?page=classes")[0], 200)
+                employee_id = "sprint2-" + secrets.token_hex(5)
+                staff_values = {
+                    "employee_id": employee_id,
+                    "category": "staff",
+                    "name": "Authorized " + role,
+                    "designation": "Office Administrator",
+                    "department": "Administration",
+                    "email": f"{employee_id}@example.test",
+                    "phone": "+91-90000-12345",
+                    "joining_date": "2024-06-01",
+                    "status": "Active",
+                }
+                self.assertEqual(
+                    self.request(role, "/staff/add", staff_values)[0], 200
+                )
+
+        for role in ("Class Teacher", "Subject Teacher", "Parent", "Technical Team"):
+            with self.subTest(role=role):
+                self.assertEqual(self.request(role, "/?page=staff")[0], 403)
+                self.assertEqual(
+                    self.request(role, "/staff/add", {})[0], 403
+                )
+                self.assertEqual(
+                    self.request(role, "/classes/add", {})[0], 403
+                )
+                if role != "Technical Team":
+                    status, classes_page = self.request(role, "/?page=classes")
+                    self.assertEqual(status, 200)
+                    self.assertNotIn("Create class section", classes_page)
+                    self.assertNotIn("Class and section administration", classes_page)
 
 
 if __name__ == "__main__":
