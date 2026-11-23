@@ -1429,11 +1429,403 @@ def dashboard(db: sqlite3.Connection, user: sqlite3.Row) -> str:
     return content
 
 
+def attendance_page(
+    db: sqlite3.Connection, user: sqlite3.Row, params: dict[str, list[str]],
+) -> str:
+    scope, scope_params = student_scope(user, "s", "c")
+    sections = db.execute(
+        "SELECT DISTINCT c.section_id,c.class_name,c.section_name,c.academic_session "
+        "FROM class_sections c LEFT JOIN students s ON s.section_id=c.section_id "
+        "WHERE " + scope +
+        " ORDER BY c.class_name,c.section_name,c.academic_session",
+        scope_params,
+    ).fetchall()
+    students = db.execute(
+        "SELECT s.student_id,s.full_name,s.admission_number,c.class_name,"
+        "c.section_name,s.roll_number FROM students s "
+        "JOIN class_sections c ON c.section_id=s.section_id "
+        "WHERE s.status='Active' AND " + scope +
+        " ORDER BY c.class_name,c.section_name,s.roll_number",
+        scope_params,
+    ).fetchall()
+
+    section_by_id = {row["section_id"]: row for row in sections}
+    classes = sorted({row["class_name"] for row in sections})
+    selected_class = params.get("class_name", [""])[0].strip()
+    selected_section_id = params.get("section_id", [""])[0].strip()
+    requested_section = section_by_id.get(selected_section_id)
+    if requested_section and (
+        not selected_class or requested_section["class_name"] == selected_class
+    ):
+        selected_class = requested_section["class_name"]
+    else:
+        requested_section = None
+        selected_section_id = ""
+    if not selected_section_id and selected_class:
+        requested_section = next(
+            (row for row in sections if row["class_name"] == selected_class), None
+        )
+        selected_section_id = requested_section["section_id"] if requested_section else ""
+    if not selected_section_id and sections and not selected_class:
+        requested_section = sections[0]
+        selected_section_id = requested_section["section_id"]
+        selected_class = requested_section["class_name"]
+
+    requested_date = params.get("attendance_date", [""])[0].strip()
+    date_error = ""
+    try:
+        selected_date = date.fromisoformat(requested_date) if requested_date else date.today()
+        if requested_date and selected_date.isoformat() != requested_date:
+            raise ValueError
+    except ValueError:
+        selected_date = date.today()
+        date_error = "Enter a valid attendance date."
+    attendance_date = selected_date.isoformat()
+
+    def options(values: list[str], selected: str) -> str:
+        return "".join(
+            f'<option value="{html.escape(value)}"'
+            f'{" selected" if value == selected else ""}>'
+            f'{html.escape(value)}</option>'
+            for value in values
+        )
+
+    def render_table(headers: list[str], rows: list[tuple]) -> str:
+        if not rows:
+            return '<div class="empty">No records available.</div>'
+        head = "".join(f"<th>{html.escape(label)}</th>" for label in headers)
+        body = "".join(
+            "<tr>" + "".join(
+                f"<td>{html.escape('' if value is None else str(value))}</td>"
+                for value in row
+            ) + "</tr>"
+            for row in rows
+        )
+        return (
+            '<div class="table-wrap"><table><thead><tr>' + head +
+            "</tr></thead><tbody>" + body + "</tbody></table></div>"
+        )
+
+    notice = ""
+    if params.get("saved") == ["1"]:
+        notice = '<div class="notice">Attendance saved successfully.</div>'
+    if date_error:
+        notice += f'<div class="notice" role="alert">{date_error}</div>'
+    if params.get("section_id") and not requested_section:
+        notice += (
+            '<div class="notice" role="alert">'
+            'Choose a class section available to your account.</div>'
+        )
+
+    class_options = options(classes, selected_class)
+    section_options = "".join(
+        f'<option value="{html.escape(row["section_id"])}"'
+        f'{" selected" if row["section_id"] == selected_section_id else ""}>'
+        f'{html.escape(row["class_name"])} · {html.escape(row["section_name"])}'
+        f' ({html.escape(row["academic_session"])})</option>'
+        for row in sections
+        if not selected_class or row["class_name"] == selected_class
+    )
+    selection_form = f"""<section class="panel"><h2>Select class, section and date</h2>
+<form method="get" action="/"><input type="hidden" name="page" value="attendance">
+<div class="filter-grid">
+<label>Class<select name="class_name"><option value="">All available classes</option>{class_options}</select></label>
+<label>Section<select name="section_id"><option value="">Select a section</option>{section_options}</select></label>
+<label>Attendance date<input type="date" name="attendance_date" value="{attendance_date}" required></label>
+</div><div style="margin-top:14px"><button type="submit">Load attendance</button></div></form></section>"""
+
+    roster = db.execute(
+        "SELECT s.student_id,s.full_name,s.admission_number,s.roll_number,"
+        "a.status FROM students s JOIN class_sections c ON c.section_id=s.section_id "
+        "LEFT JOIN attendance a ON a.student_id=s.student_id AND a.attendance_date=? "
+        "WHERE s.section_id=? AND s.status='Active' AND " + scope +
+        " ORDER BY s.roll_number,s.full_name",
+        (attendance_date, selected_section_id, *scope_params),
+    ).fetchall() if requested_section else []
+    total = len(roster)
+    counts = {
+        status: sum(row["status"] == status for row in roster)
+        for status in ("Present", "Absent", "Late")
+    }
+    percentage = (
+        (counts["Present"] + counts["Late"]) * 100 / total if total else 0
+    )
+    cards = (
+        '<div class="cards">' +
+        "".join(
+            f'<section class="card"><div class="label">{label}</div>'
+            f'<div class="value">{value}</div><div class="hint">{hint}</div></section>'
+            for label, value, hint in (
+                ("Total students", total, "Active students in the selected section"),
+                ("Present", counts["Present"], "Marked present"),
+                ("Absent", counts["Absent"], "Marked absent"),
+                ("Late", counts["Late"], "Arrived late"),
+                ("Attendance", f"{percentage:.1f}%", "Present and late / total students"),
+            )
+        ) + "</div>"
+    ) if requested_section else ""
+
+    can_manage = user["role"] in ADMIN_ROLES | {"Class Teacher"}
+    if requested_section and roster:
+        roster_rows = []
+        for row in roster:
+            previous = row["status"] or ""
+            status_options = "".join(
+                f'<option value="{status}"'
+                f'{" selected" if previous == status else ""}>{status}</option>'
+                for status in ("Present", "Absent", "Late")
+            )
+            if previous == "Leave":
+                status_options += '<option value="Leave" selected>Leave (legacy)</option>'
+            roster_rows.append(
+                "<tr>" +
+                f'<td>{row["roll_number"]}</td>'
+                f'<td>{html.escape(row["full_name"])}</td>'
+                f'<td>{html.escape(row["admission_number"])}</td>'
+                + (
+                    f'<td><select class="attendance-status" name="status_{html.escape(row["student_id"])}" '
+                    'aria-label="Attendance status" required>'
+                    '<option value="">Choose status</option>' + status_options +
+                    "</select></td>"
+                    if can_manage else
+                    f'<td>{html.escape(previous or "Not marked")}</td>'
+                ) +
+                "</tr>"
+            )
+        if can_manage:
+            roster_content = (
+                '<form method="post" action="/attendance/mark" id="attendance-form">'
+                f'<input type="hidden" name="csrf" value="{html.escape(user["csrf_token"])}">'
+                f'<input type="hidden" name="section_id" value="{html.escape(selected_section_id)}">'
+                f'<input type="hidden" name="attendance_date" value="{attendance_date}">'
+                '<div class="profile-actions"><button type="button" id="mark-all-present">'
+                'Mark all present</button><button type="submit">Save attendance</button></div>'
+                '<div class="table-wrap"><table><thead><tr><th>Roll</th><th>Student</th>'
+                '<th>Admission no.</th><th>Status</th></tr></thead><tbody>' +
+                "".join(roster_rows) +
+                '</tbody></table></div></form>'
+                '<script>document.getElementById("mark-all-present").addEventListener("click",'
+                '()=>document.querySelectorAll("#attendance-form .attendance-status").forEach(select=>select.value="Present"));</script>'
+            )
+        else:
+            roster_content = (
+                '<div class="table-wrap"><table><thead><tr><th>Roll</th><th>Student</th>'
+                '<th>Admission no.</th><th>Status</th></tr></thead><tbody>' +
+                "".join(roster_rows) +
+                '</tbody></table></div>'
+            )
+    elif requested_section:
+        roster_content = '<div class="empty">No active students in this section.</div>'
+    else:
+        roster_content = (
+            '<div class="empty">Select a class section to view its attendance.</div>'
+        )
+    if requested_section and can_manage:
+        roster_panel = (
+            '<section class="panel"><h2>Daily class register · ' +
+            html.escape(requested_section["class_name"]) + " · " +
+            html.escape(requested_section["section_name"]) + " · " +
+            attendance_date + "</h2>" + roster_content + "</section>"
+        )
+    else:
+        roster_panel = (
+            '<section class="panel"><h2>Daily class register</h2>' +
+            roster_content + "</section>"
+        )
+
+    overview_query = (
+        "SELECT a.attendance_date,c.class_name,c.section_name,c.section_id,"
+        "SUM(CASE WHEN a.status='Present' THEN 1 ELSE 0 END),"
+        "SUM(CASE WHEN a.status='Absent' THEN 1 ELSE 0 END),"
+        "SUM(CASE WHEN a.status='Late' THEN 1 ELSE 0 END),"
+        "(SELECT COUNT(*) FROM students active WHERE active.section_id=c.section_id "
+        "AND active.status='Active') "
+        "FROM attendance a JOIN students s ON s.student_id=a.student_id "
+        "JOIN class_sections c ON c.section_id=s.section_id "
+        "WHERE s.status='Active' AND " + scope
+    )
+    overview_params: tuple[object, ...] = (*scope_params,)
+    if selected_class:
+        overview_query += " AND c.class_name=?"
+        overview_params += (selected_class,)
+    if requested_section:
+        overview_query += " AND c.section_id=?"
+        overview_params += (selected_section_id,)
+    overview_rows = db.execute(
+        overview_query +
+        " GROUP BY a.attendance_date,c.section_id "
+        "ORDER BY a.attendance_date DESC,c.class_name,c.section_name LIMIT 30",
+        overview_params,
+    ).fetchall()
+    overview_table = render_table(
+        ["Date", "Class", "Section", "Present", "Absent", "Late", "Attendance"],
+        [
+            (
+                row["attendance_date"], row["class_name"], row["section_name"],
+                row[4], row[5], row[6],
+                f"{(row[4] + row[6]) * 100 / row[7]:.1f}%" if row[7] else "0.0%",
+            )
+            for row in overview_rows
+        ],
+    )
+
+    absent_date = params.get("absent_date", [attendance_date])[0].strip()
+    absent_class = params.get("absent_class", [""])[0].strip()
+    absent_section = params.get("absent_section_id", [""])[0].strip()
+    absent_error = ""
+    try:
+        parsed_absent_date = date.fromisoformat(absent_date)
+        if parsed_absent_date.isoformat() != absent_date:
+            raise ValueError
+    except ValueError:
+        absent_error = "Enter a valid date for the absent-student filter."
+        absent_date = attendance_date
+    absent_query = (
+        "SELECT s.full_name,s.admission_number,c.class_name,c.section_name,"
+        "a.attendance_date,a.status FROM attendance a "
+        "JOIN students s ON s.student_id=a.student_id "
+        "JOIN class_sections c ON c.section_id=s.section_id "
+        "WHERE a.status='Absent' AND s.status='Active' AND " + scope
+    )
+    absent_params: tuple[object, ...] = (*scope_params,)
+    if absent_date:
+        absent_query += " AND a.attendance_date=?"
+        absent_params += (absent_date,)
+    if absent_class:
+        absent_query += " AND c.class_name=?"
+        absent_params += (absent_class,)
+    if absent_section:
+        if absent_section in section_by_id:
+            absent_query += " AND c.section_id=?"
+            absent_params += (absent_section,)
+        else:
+            absent_query += " AND 0=1"
+    absent_rows = db.execute(
+        absent_query + " ORDER BY c.class_name,c.section_name,s.full_name",
+        absent_params,
+    ).fetchall()
+    absent_controls = (
+        '<section class="panel"><h2>Absent students</h2>' +
+        (f'<div class="notice" role="alert">{absent_error}</div>' if absent_error else "") +
+        '<form method="get" action="/"><input type="hidden" name="page" value="attendance">'
+        f'<input type="hidden" name="attendance_date" value="{attendance_date}">'
+        '<div class="filter-grid">'
+        f'<label>Date<input type="date" name="absent_date" value="{html.escape(absent_date)}" required></label>'
+        '<label>Class<select name="absent_class"><option value="">All available classes</option>' +
+        options(classes, absent_class) + "</select></label>"
+        '<label>Section<select name="absent_section_id"><option value="">All sections</option>' +
+        "".join(
+            f'<option value="{html.escape(row["section_id"])}"'
+            f'{" selected" if row["section_id"] == absent_section else ""}>'
+            f'{html.escape(row["class_name"])} · {html.escape(row["section_name"])}</option>'
+            for row in sections
+        ) +
+        '</select></label></div><div style="margin-top:14px">'
+        '<button type="submit">Filter absent students</button></div></form><br>' +
+        render_table(
+            ["Student", "Admission no.", "Class", "Section", "Date", "Status"],
+            [tuple(row) for row in absent_rows],
+        ) + "</section>"
+    )
+
+    history_id = params.get("history_student_id", [""])[0].strip()
+    history_from = params.get("history_from", [""])[0].strip()
+    history_to = params.get("history_to", [""])[0].strip()
+    history_error = ""
+    parsed_from = parsed_to = None
+    for label, value in (("start", history_from), ("end", history_to)):
+        if value:
+            try:
+                parsed_value = date.fromisoformat(value)
+                if parsed_value.isoformat() != value:
+                    raise ValueError
+                if label == "start":
+                    parsed_from = parsed_value
+                else:
+                    parsed_to = parsed_value
+            except ValueError:
+                history_error = "Enter valid start and end dates for attendance history."
+    if parsed_from and parsed_to and parsed_from > parsed_to:
+        history_error = "The history start date must not be after its end date."
+    student_options = "".join(
+        f'<option value="{html.escape(row["student_id"])}"'
+        f'{" selected" if row["student_id"] == history_id else ""}>'
+        f'{html.escape(row["full_name"])} · {html.escape(row["admission_number"])} '
+        f'· {html.escape(row["class_name"])} {html.escape(row["section_name"])}</option>'
+        for row in students
+    )
+    history_content = '<div class="empty">Select a student to view attendance history.</div>'
+    history_student = next(
+        (row for row in students if row["student_id"] == history_id), None
+    )
+    if history_id and not history_student:
+        history_error = "That student is not available to your account."
+    elif history_student and not history_error:
+        history_query = (
+            "SELECT attendance_date,status FROM attendance WHERE student_id=?"
+        )
+        history_params: tuple[object, ...] = (history_id,)
+        if parsed_from:
+            history_query += " AND attendance_date>=?"
+            history_params += (history_from,)
+        if parsed_to:
+            history_query += " AND attendance_date<=?"
+            history_params += (history_to,)
+        history_rows = db.execute(
+            history_query + " ORDER BY attendance_date DESC",
+            history_params,
+        ).fetchall()
+        overall = db.execute(
+            "SELECT COUNT(*),SUM(CASE WHEN status IN ('Present','Late') "
+            "THEN 1 ELSE 0 END) FROM attendance WHERE student_id=?",
+            (history_id,),
+        ).fetchone()
+        overall_total = overall[0] or 0
+        overall_attended = overall[1] or 0
+        overall_percentage = (
+            overall_attended * 100 / overall_total if overall_total else 0
+        )
+        history_content = (
+            '<div class="profile-summary"><section class="card"><div class="label">'
+            'Overall attendance</div><div class="value">'
+            f'{overall_percentage:.1f}%</div><div class="hint">'
+            f'{overall_attended} attended of {overall_total} recorded days</div></section></div>' +
+            render_table(
+                ["Date", "Status"],
+                [(row["attendance_date"], row["status"]) for row in history_rows],
+            )
+        )
+    history_panel = (
+        '<section class="panel"><h2>Student attendance history</h2>' +
+        (f'<div class="notice" role="alert">{history_error}</div>' if history_error else "") +
+        '<form method="get" action="/"><input type="hidden" name="page" value="attendance">'
+        f'<input type="hidden" name="attendance_date" value="{attendance_date}">'
+        '<div class="filter-grid"><label>Student<select name="history_student_id">'
+        '<option value="">Select a student</option>' + student_options +
+        '</select></label>'
+        f'<label>From<input type="date" name="history_from" value="{html.escape(history_from)}"></label>'
+        f'<label>To<input type="date" name="history_to" value="{html.escape(history_to)}"></label>'
+        '</div><div style="margin-top:14px"><button type="submit">View history</button></div>'
+        '</form><br>' + history_content + "</section>"
+    )
+
+    return (
+        '<main><div class="dashboard-head"><div><p class="eyebrow">People & learning</p>'
+        '<h1>Attendance</h1><p class="sub">Daily class registers, attendance summaries, '
+        'absent students and student history.</p></div></div>' +
+        notice + selection_form + cards + roster_panel +
+        '<section class="panel" style="margin-top:18px"><h2>Date-wise attendance overview</h2>' +
+        overview_table + "</section>" + absent_controls + history_panel + "</main>"
+    )
+
+
 def module_page(db: sqlite3.Connection, page: str, user: sqlite3.Row,
                 params: dict[str, list[str]] | None = None) -> str:
     if not can_access_module(user, page):
         raise PermissionError
     params = params or {}
+    if page == "attendance":
+        return attendance_page(db, user, params)
     config = {
         "students": (
             "Students", "Student records across Nursery to Class XII.",
@@ -3114,6 +3506,104 @@ Type <strong>RESET DEMO DATA</strong> to confirm. Your demo login will be retain
                 f"school_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0{secure_cookie}",
             )])
             return
+        if self.path == "/attendance/mark":
+            if user["role"] not in ADMIN_ROLES | {"Class Teacher"}:
+                self.send_html("<main><h1>Not authorized</h1></main>", 403)
+                return
+            section_id = form.get("section_id", [""])[0].strip()
+            attendance_date = form.get("attendance_date", [""])[0].strip()
+            try:
+                parsed_date = date.fromisoformat(attendance_date)
+                if (
+                    not re.fullmatch(r"\d{4}-\d{2}-\d{2}", attendance_date)
+                    or parsed_date.isoformat() != attendance_date
+                ):
+                    raise ValueError
+            except ValueError:
+                self.send_html("<main><h1>Invalid attendance date</h1></main>", 400)
+                return
+            if not section_id:
+                self.send_html("<main><h1>Select a class section</h1></main>", 400)
+                return
+            with database_connection(self.database) as db:
+                section_query = (
+                    "SELECT section_id,class_name,section_name FROM class_sections "
+                    "WHERE section_id=?"
+                )
+                section_params: tuple[str, ...] = (section_id,)
+                if user["role"] == "Class Teacher":
+                    if not user["employee_id"]:
+                        self.send_html("<main><h1>Not authorized</h1></main>", 403)
+                        return
+                    section_query += " AND homeroom_teacher_id=?"
+                    section_params += (user["employee_id"],)
+                section = db.execute(section_query, section_params).fetchone()
+                if not section:
+                    self.send_html(
+                        "<main><h1>Not authorized</h1>"
+                        "<p>Attendance can only be managed for an assigned class section.</p></main>",
+                        403,
+                    )
+                    return
+                roster = db.execute(
+                    "SELECT student_id FROM students "
+                    "WHERE section_id=? AND status='Active' ORDER BY roll_number",
+                    (section_id,),
+                ).fetchall()
+                if not roster:
+                    self.send_html(
+                        "<main><h1>No active students</h1>"
+                        "<p>There are no students to mark in this section.</p></main>",
+                        400,
+                    )
+                    return
+                statuses = {
+                    row["student_id"]: form.get(
+                        "status_" + row["student_id"], [""]
+                    )[0]
+                    for row in roster
+                }
+                existing_statuses = {
+                    row["student_id"]: row["status"]
+                    for row in db.execute(
+                        "SELECT student_id,status FROM attendance "
+                        "WHERE attendance_date=? AND student_id IN (" +
+                        ",".join("?" for _ in roster) + ")",
+                        (attendance_date, *(row["student_id"] for row in roster)),
+                    )
+                }
+                if any(
+                    status not in {"Present", "Absent", "Late"}
+                    and not (status == "Leave" and existing_statuses.get(student_id) == "Leave")
+                    for student_id, status in statuses.items()
+                ):
+                    self.send_html(
+                        "<main><h1>Invalid attendance status</h1>"
+                        "<p>Choose Present, Absent, or Late for every active student.</p></main>",
+                        400,
+                    )
+                    return
+                for student_id, status in statuses.items():
+                    db.execute(
+                        "INSERT INTO attendance "
+                        "(attendance_id,student_id,attendance_date,status,is_demo) "
+                        "VALUES (?,?,?,?,0) ON CONFLICT(student_id,attendance_date) "
+                        "DO UPDATE SET status=excluded.status",
+                        (
+                            "attendance-" + secrets.token_hex(12), student_id,
+                            attendance_date, status,
+                        ),
+                    )
+            self.redirect(
+                "/?page=attendance&" +
+                urlencode({
+                    "attendance_date": attendance_date,
+                    "class_name": section["class_name"],
+                    "section_id": section_id,
+                    "saved": "1",
+                })
+            )
+            return
         if self.path == "/attendance/update":
             if user["role"] not in ADMIN_ROLES | {"Class Teacher"}:
                 self.send_html("<main><h1>Not authorized</h1></main>", 403)
@@ -3122,11 +3612,16 @@ Type <strong>RESET DEMO DATA</strong> to confirm. Your demo login will be retain
             attendance_date = form.get("attendance_date", [""])[0]
             status = form.get("status", [""])[0]
             try:
-                date.fromisoformat(attendance_date)
+                parsed_date = date.fromisoformat(attendance_date)
+                if (
+                    not re.fullmatch(r"\d{4}-\d{2}-\d{2}", attendance_date)
+                    or parsed_date.isoformat() != attendance_date
+                ):
+                    raise ValueError
             except ValueError:
                 self.send_html("<main><h1>Invalid attendance date</h1></main>", 400)
                 return
-            if status not in {"Present", "Absent", "Late", "Leave"}:
+            if status not in {"Present", "Absent", "Late"}:
                 self.send_html("<main><h1>Invalid attendance status</h1></main>", 400)
                 return
             scope, params = student_scope(user, "s", "c")
