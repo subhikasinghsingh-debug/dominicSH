@@ -37,6 +37,7 @@ NAV_ITEMS = [
     ("dashboard", "Dashboard"), ("students", "Students"), ("staff", "Staff"),
     ("classes", "Classes"),
     ("attendance", "Attendance"), ("fees", "Fees"), ("payments", "Payment History"),
+    ("attendance_reports", "Attendance Reports"),
     ("buses", "Transport"),
     ("boards", "Smart Boards"), ("issues", "Technical Issues"),
     ("announcements", "Announcements"), ("academics", "Examinations"),
@@ -44,7 +45,7 @@ NAV_ITEMS = [
 ]
 NAV_GROUPS = (
     ("Overview", ("dashboard",)),
-    ("People & learning", ("students", "staff", "classes", "attendance", "academics", "reports")),
+    ("People & learning", ("students", "staff", "classes", "attendance", "attendance_reports", "academics", "reports")),
     ("Administration", ("fees", "payments")),
     ("Operations", ("buses", "boards", "issues")),
     ("Community", ("announcements",)),
@@ -55,6 +56,7 @@ NAV_ICONS = {
     "staff": '<circle cx="9" cy="8" r="3"/><path d="M3.5 19a5.5 5.5 0 0 1 11 0M16 5.5a3 3 0 0 1 0 5.8M17 14a5 5 0 0 1 3.5 4.8"/>',
     "classes": '<path d="M4 4h16v16H4zM4 10h16M10 10v10"/>',
     "attendance": '<path d="m5 12 4 4L19 6"/><path d="M20 12v7H4V5h11"/>',
+    "attendance_reports": '<path d="M4 19V5M4 19h16M8 15v-4M12 15V8M16 15V5"/>',
     "fees": '<rect x="4" y="3" width="16" height="18" rx="2"/><path d="M8 8h8M8 12h8M8 16h4"/>',
     "payments": '<path d="M7 7h13l-3-3M17 17H4l3 3M20 7l-4 4M4 17l4-4"/>',
     "buses": '<path d="M5 17V6a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v11M5 12h14M5 17h14"/><circle cx="8" cy="18" r="1.5"/><circle cx="16" cy="18" r="1.5"/>',
@@ -76,9 +78,9 @@ DEMO_ACCOUNT_IDS = {
 ROLE_MODULES = {
     "Director": {key for key, _ in NAV_ITEMS},
     "Principal": {key for key, _ in NAV_ITEMS},
-    "Class Teacher": {"dashboard", "students", "classes", "attendance", "academics", "announcements"},
+    "Class Teacher": {"dashboard", "students", "classes", "attendance", "attendance_reports", "academics", "announcements"},
     "Subject Teacher": {"dashboard", "students", "classes", "academics", "announcements"},
-    "Parent": {"dashboard", "students", "classes", "attendance", "fees", "payments", "academics", "announcements", "buses"},
+    "Parent": {"dashboard", "students", "classes", "attendance", "attendance_reports", "fees", "payments", "academics", "announcements", "buses"},
     "Technical Team": {"dashboard", "boards", "issues"},
 }
 PAGE_ALIASES = {"examinations": "academics"}
@@ -1193,6 +1195,7 @@ def _dashboard_modules(user: sqlite3.Row) -> str:
         "staff": "Browse teachers and staff",
         "classes": "Browse classes, sections, and rosters",
         "attendance": "Review and update attendance",
+        "attendance_reports": "Review attendance reports and trends",
         "fees": "Review fee balances",
         "payments": "Review payment history",
         "buses": "Browse transport routes",
@@ -1819,6 +1822,608 @@ def attendance_page(
     )
 
 
+def _attendance_report_filters(
+    db: sqlite3.Connection, user: sqlite3.Row, params: dict[str, list[str]],
+) -> dict[str, str | date | None]:
+    if user["role"] not in ADMIN_ROLES | {"Class Teacher", "Parent"}:
+        raise PermissionError
+
+    start_text = params.get("start_date", [""])[0].strip()
+    end_text = params.get("end_date", [""])[0].strip()
+    start_date = date.fromisoformat(start_text) if start_text else None
+    end_date = date.fromisoformat(end_text) if end_text else None
+    if (
+        (start_date and start_date.isoformat() != start_text)
+        or (end_date and end_date.isoformat() != end_text)
+    ):
+        raise ValueError("Enter valid start and end dates.")
+    if start_date and end_date and start_date > end_date:
+        raise ValueError("The start date must not be after the end date.")
+
+    sections = _attendance_report_sections(db, user)
+    classes = {row["class_name"] for row in sections}
+    class_name = params.get("class_name", [""])[0].strip()
+    section_id = params.get("section_id", [""])[0].strip()
+    section_ids = {row["section_id"] for row in sections}
+    if section_id and section_id not in section_ids:
+        raise PermissionError
+    if class_name and class_name not in classes:
+        if user["role"] == "Class Teacher":
+            raise PermissionError
+    if section_id:
+        section = next(row for row in sections if row["section_id"] == section_id)
+        if class_name and section["class_name"] != class_name:
+            raise PermissionError
+        class_name = section["class_name"]
+
+    return {
+        "class_name": class_name,
+        "section_id": section_id,
+        "start_date": start_date,
+        "end_date": end_date,
+    }
+
+
+def _attendance_report_sections(
+    db: sqlite3.Connection, user: sqlite3.Row,
+) -> list[sqlite3.Row]:
+    scope, scope_params = student_scope(user, "s", "c")
+    return db.execute(
+        "SELECT DISTINCT c.section_id,c.class_name,c.section_name,c.academic_session "
+        "FROM class_sections c LEFT JOIN students s ON s.section_id=c.section_id "
+        "WHERE " + scope + " ORDER BY c.class_name,c.section_name,c.academic_session",
+        scope_params,
+    ).fetchall()
+
+
+def _attendance_report_where(
+    filters: dict[str, str | date | None], alias: str = "c",
+) -> tuple[str, tuple[object, ...]]:
+    clauses: list[str] = []
+    values: list[object] = []
+    if filters["class_name"]:
+        clauses.append(f"{alias}.class_name=?")
+        values.append(filters["class_name"])
+    if filters["section_id"]:
+        clauses.append(f"{alias}.section_id=?")
+        values.append(filters["section_id"])
+    return (
+        (" AND " + " AND ".join(clauses)) if clauses else "",
+        tuple(values),
+    )
+
+
+def _attendance_student_report_rows(
+    db: sqlite3.Connection, user: sqlite3.Row,
+    filters: dict[str, str | date | None], search: str = "",
+) -> list[sqlite3.Row]:
+    scope, scope_params = student_scope(user, "s", "c")
+    join_date = ""
+    date_params: tuple[str, ...] = ()
+    if filters["start_date"]:
+        join_date += " AND a.attendance_date>=?"
+        date_params += (filters["start_date"].isoformat(),)
+    if filters["end_date"]:
+        join_date += " AND a.attendance_date<=?"
+        date_params += (filters["end_date"].isoformat(),)
+    filter_sql, filter_params = _attendance_report_where(filters)
+    search_sql = ""
+    search_params: tuple[str, ...] = ()
+    if search:
+        search_sql = (
+            " AND (LOWER(s.full_name) LIKE ? OR "
+            "LOWER(s.admission_number) LIKE ?)"
+        )
+        needle = "%" + search.lower() + "%"
+        search_params = (needle, needle)
+    return db.execute(
+        "SELECT s.full_name,s.admission_number,c.class_name,c.section_name,"
+        "COUNT(a.attendance_id) AS recorded_days,"
+        "SUM(CASE WHEN a.status='Present' THEN 1 ELSE 0 END) AS present_days,"
+        "SUM(CASE WHEN a.status='Absent' THEN 1 ELSE 0 END) AS absent_days,"
+        "SUM(CASE WHEN a.status='Leave' THEN 1 ELSE 0 END) AS leave_days,"
+        "SUM(CASE WHEN a.status='Late' THEN 1 ELSE 0 END) AS late_days "
+        "FROM students s JOIN class_sections c ON c.section_id=s.section_id "
+        "LEFT JOIN attendance a ON a.student_id=s.student_id" + join_date +
+        " WHERE s.status='Active' AND " + scope + filter_sql + search_sql +
+        " GROUP BY s.student_id "
+        "ORDER BY c.class_name,c.section_name,s.full_name",
+        (*date_params, *scope_params, *filter_params, *search_params),
+    ).fetchall()
+
+
+def _attendance_class_report_rows(
+    db: sqlite3.Connection, user: sqlite3.Row,
+    filters: dict[str, str | date | None],
+) -> list[sqlite3.Row]:
+    scope, scope_params = student_scope(user, "s", "c")
+    filter_sql, filter_params = _attendance_report_where(filters)
+    join_date = ""
+    date_params: tuple[str, ...] = ()
+    if filters["start_date"]:
+        join_date += " AND a.attendance_date>=?"
+        date_params += (filters["start_date"].isoformat(),)
+    if filters["end_date"]:
+        join_date += " AND a.attendance_date<=?"
+        date_params += (filters["end_date"].isoformat(),)
+    return db.execute(
+        "SELECT c.class_name,c.section_name,c.section_id,"
+        "COUNT(DISTINCT s.student_id) AS active_students,"
+        "COUNT(a.attendance_id) AS recorded_days,"
+        "SUM(CASE WHEN a.status='Present' THEN 1 ELSE 0 END) AS present_days,"
+        "SUM(CASE WHEN a.status='Absent' THEN 1 ELSE 0 END) AS absent_days,"
+        "SUM(CASE WHEN a.status='Leave' THEN 1 ELSE 0 END) AS leave_days,"
+        "SUM(CASE WHEN a.status='Late' THEN 1 ELSE 0 END) AS late_days "
+        "FROM class_sections c "
+        "LEFT JOIN students s ON s.section_id=c.section_id AND s.status='Active' "
+        "LEFT JOIN attendance a ON a.student_id=s.student_id" + join_date +
+        " WHERE " + scope + filter_sql +
+        " GROUP BY c.section_id ORDER BY c.class_name,c.section_name",
+        (*date_params, *scope_params, *filter_params),
+    ).fetchall()
+
+
+def _attendance_datewise_report_rows(
+    db: sqlite3.Connection, user: sqlite3.Row,
+    filters: dict[str, str | date | None],
+) -> list[sqlite3.Row]:
+    scope, scope_params = student_scope(user, "s", "c")
+    clauses = ["s.status='Active'", scope]
+    values: list[object] = list(scope_params)
+    filter_sql, filter_params = _attendance_report_where(filters)
+    if filters["start_date"]:
+        clauses.append("a.attendance_date>=?")
+        values.append(filters["start_date"].isoformat())
+    if filters["end_date"]:
+        clauses.append("a.attendance_date<=?")
+        values.append(filters["end_date"].isoformat())
+    values.extend(filter_params)
+    return db.execute(
+        "SELECT a.attendance_date,c.class_name,c.section_name,"
+        "(SELECT COUNT(*) FROM students active "
+        "WHERE active.section_id=c.section_id AND active.status='Active') AS active_students,"
+        "SUM(CASE WHEN a.status='Present' THEN 1 ELSE 0 END) AS present_days,"
+        "SUM(CASE WHEN a.status='Absent' THEN 1 ELSE 0 END) AS absent_days,"
+        "SUM(CASE WHEN a.status='Leave' THEN 1 ELSE 0 END) AS leave_days,"
+        "SUM(CASE WHEN a.status='Late' THEN 1 ELSE 0 END) AS late_days,"
+        "COUNT(a.attendance_id) AS recorded_days "
+        "FROM attendance a JOIN students s ON s.student_id=a.student_id "
+        "JOIN class_sections c ON c.section_id=s.section_id "
+        "WHERE " + " AND ".join(clauses) + filter_sql +
+        " GROUP BY a.attendance_date,c.section_id "
+        "ORDER BY a.attendance_date DESC,c.class_name,c.section_name",
+        tuple(values),
+    ).fetchall()
+
+
+def _attendance_report_table(headers: list[str], rows: list[tuple]) -> str:
+    if not rows:
+        return '<div class="empty">No attendance records match these filters.</div>'
+    return (
+        '<div class="table-wrap"><table><thead><tr>' +
+        "".join(f"<th>{html.escape(label)}</th>" for label in headers) +
+        "</tr></thead><tbody>" +
+        "".join(
+            "<tr>" + "".join(
+                f"<td>{html.escape('' if value is None else str(value))}</td>"
+                for value in row
+            ) + "</tr>"
+            for row in rows
+        ) + "</tbody></table></div>"
+    )
+
+
+def _attendance_report_export_url(
+    kind: str, params: dict[str, str], filters: dict[str, str | date | None],
+) -> str:
+    query = {
+        key: str(value) for key, value in filters.items()
+        if value is not None and value != ""
+    }
+    query.update(params)
+    return "/export/attendance/" + kind + "?" + urlencode(query)
+
+
+def _attendance_parent_report(
+    db: sqlite3.Connection, user: sqlite3.Row,
+) -> str:
+    filters: dict[str, str | date | None] = {
+        "class_name": "", "section_id": "", "start_date": None, "end_date": None,
+    }
+    rows = _attendance_student_report_rows(db, user, filters)
+    report_rows = [
+        (
+            row["full_name"], row["admission_number"], row["class_name"],
+            row["section_name"], row["recorded_days"], row["present_days"] or 0,
+            row["absent_days"] or 0, row["leave_days"] or 0,
+            row["late_days"] or 0,
+            f"{(row['present_days'] or 0) * 100 / row['recorded_days']:.1f}%"
+            if row["recorded_days"] else "0.0%",
+        )
+        for row in rows
+    ]
+    return (
+        '<main><div class="dashboard-head"><div><p class="eyebrow">Family</p>'
+        '<h1>Attendance Summary</h1><p class="sub">Attendance for your linked child only.</p>'
+        '</div></div><section class="panel">' +
+        _attendance_report_table(
+            ["Student", "Admission no.", "Class", "Section", "Recorded days",
+             "Present", "Absent", "Leave", "Late", "Attendance"],
+            report_rows,
+        ) + "</section></main>"
+    )
+
+
+def attendance_reports_page(
+    db: sqlite3.Connection, user: sqlite3.Row, params: dict[str, list[str]],
+) -> str:
+    if user["role"] == "Parent":
+        return _attendance_parent_report(db, user)
+    if user["role"] not in ADMIN_ROLES | {"Class Teacher"}:
+        raise PermissionError
+
+    filters = _attendance_report_filters(db, user, params)
+    sections = _attendance_report_sections(db, user)
+    class_name = str(filters["class_name"] or "")
+    section_id = str(filters["section_id"] or "")
+    class_options = "".join(
+        f'<option value="{html.escape(name)}"'
+        f'{" selected" if name == class_name else ""}>{html.escape(name)}</option>'
+        for name in sorted({row["class_name"] for row in sections})
+    )
+    section_options = "".join(
+        f'<option value="{html.escape(row["section_id"])}"'
+        f'{" selected" if row["section_id"] == section_id else ""}>'
+        f'{html.escape(row["class_name"])} · {html.escape(row["section_name"])}</option>'
+        for row in sections if not class_name or row["class_name"] == class_name
+    )
+    start_text = filters["start_date"].isoformat() if filters["start_date"] else ""
+    end_text = filters["end_date"].isoformat() if filters["end_date"] else ""
+
+    def filter_form(action: str, extra: str, label: str) -> str:
+        return (
+            '<form method="get" action="/"><input type="hidden" name="page" '
+            'value="attendance_reports"><div class="filter-grid">'
+            '<label>Class<select name="class_name" '
+            'onchange="this.form.elements.section_id.value=\'\'">'
+            '<option value="">All available classes</option>' +
+            class_options + '</select></label><label>Section<select name="section_id">'
+            '<option value="">All available sections</option>' + section_options +
+            '</select></label>' +
+            '<label>From<input type="date" name="start_date" value="' +
+            html.escape(start_text) + '"></label><label>To<input type="date" name="end_date" value="' +
+            html.escape(end_text) + '"></label>' + extra +
+            '</div><div style="margin-top:14px"><button type="submit">' +
+            html.escape(label) + '</button></div></form>'
+        )
+
+    search = params.get("q", [""])[0].strip()
+    student_rows = _attendance_student_report_rows(db, user, filters, search)
+    student_table = _attendance_report_table(
+        ["Student", "Admission no.", "Class", "Section", "Recorded days",
+         "Present days", "Absent days", "Leave days", "Late days", "Attendance"],
+        [
+            (
+                row["full_name"], row["admission_number"], row["class_name"],
+                row["section_name"], row["recorded_days"], row["present_days"] or 0,
+                row["absent_days"] or 0, row["leave_days"] or 0,
+                row["late_days"] or 0,
+                f"{(row['present_days'] or 0) * 100 / row['recorded_days']:.1f}%"
+                if row["recorded_days"] else "0.0%",
+            )
+            for row in student_rows
+        ],
+    )
+    student_export = _attendance_report_export_url(
+        "student-wise", {"q": search}, filters,
+    )
+    student_panel = (
+        '<section class="panel"><h2>Student-wise attendance</h2>' +
+        filter_form(
+            "student-wise",
+            '<label>Search student<input type="text" name="q" value="' +
+            html.escape(search) + '" placeholder="Name or admission number"></label>',
+            "Search attendance",
+        ) + f'<p><a class="button" href="{html.escape(student_export, quote=True)}">'
+        'Export student-wise CSV</a></p>' + student_table + "</section>"
+    )
+
+    class_rows = _attendance_class_report_rows(db, user, filters)
+    daily_rows = _attendance_datewise_report_rows(db, user, filters)
+    active_students = sum(row["active_students"] for row in class_rows)
+    recorded_days = sum(row["recorded_days"] for row in class_rows)
+    present_days = sum(row["present_days"] or 0 for row in class_rows)
+    absent_days = sum(row["absent_days"] or 0 for row in class_rows)
+    leave_days = sum(row["leave_days"] or 0 for row in class_rows)
+    attendance_rate = present_days * 100 / recorded_days if recorded_days else 0
+    class_cards = (
+        '<div class="cards">' + "".join(
+            f'<section class="card"><div class="label">{label}</div>'
+            f'<div class="value">{value}</div><div class="hint">{hint}</div></section>'
+            for label, value, hint in (
+                ("Active students", active_students, "Current active roster"),
+                ("Present records", present_days, "Present student-days recorded"),
+                ("Absent records", absent_days, "Absent student-days recorded"),
+                ("Students on leave", leave_days, "Leave student-days recorded"),
+                ("Attendance", f"{attendance_rate:.1f}%",
+                 f"Present / {recorded_days:,} recorded student-days"),
+            )
+        ) + "</div>"
+    )
+    class_export = _attendance_report_export_url("class-wise", {}, filters)
+    class_panel = (
+        '<section class="panel"><h2>Class and section analytics</h2>' +
+        filter_form("class-wise", "", "Apply class filters") + class_cards +
+        f'<p><a class="button" href="{html.escape(class_export, quote=True)}">'
+        'Export class-wise CSV</a></p>' +
+        _attendance_report_table(
+            ["Class", "Section", "Active students", "Recorded student-days",
+             "Present records", "Absent records", "Leave records", "Late records",
+             "Attendance"],
+            [
+                (
+                    row["class_name"], row["section_name"], row["active_students"],
+                    row["recorded_days"], row["present_days"] or 0,
+                    row["absent_days"] or 0, row["leave_days"] or 0,
+                    row["late_days"] or 0,
+                    f"{(row['present_days'] or 0) * 100 / row['recorded_days']:.1f}%"
+                    if row["recorded_days"] else "0.0%",
+                )
+                for row in class_rows
+            ],
+        ) + '<h2 style="margin-top:22px">Date-wise attendance summary</h2>' +
+        _attendance_report_table(
+            ["Date", "Class", "Section", "Active students", "Present", "Absent",
+             "Leave", "Late", "Attendance"],
+            [
+                (
+                    row["attendance_date"], row["class_name"], row["section_name"],
+                    row["active_students"], row["present_days"] or 0,
+                    row["absent_days"] or 0, row["leave_days"] or 0,
+                    row["late_days"] or 0,
+                    f"{(row['present_days'] or 0) * 100 / row['recorded_days']:.1f}%"
+                    if row["recorded_days"] else "0.0%",
+                )
+                for row in daily_rows
+            ],
+        ) + "</section>"
+    )
+
+    month_value = params.get("month", [str(date.today().month)])[0].strip()
+    year_value = params.get("year", [str(date.today().year)])[0].strip()
+    try:
+        month = int(month_value)
+        year = int(year_value)
+        if not 1 <= month <= 12 or not 2000 <= year <= 2100:
+            raise ValueError
+    except ValueError as error:
+        raise ValueError("Choose a valid month and year.") from error
+    month_start = date(year, month, 1)
+    month_end = date(year + (month == 12), month % 12 + 1, 1) - timedelta(days=1)
+    monthly_filters = {**filters, "start_date": month_start, "end_date": month_end}
+    monthly_students = _attendance_student_report_rows(db, user, monthly_filters)
+    monthly_classes = _attendance_class_report_rows(db, user, monthly_filters)
+    monthly_present = sum(row["present_days"] or 0 for row in monthly_students)
+    monthly_absent = sum(row["absent_days"] or 0 for row in monthly_students)
+    monthly_leave = sum(row["leave_days"] or 0 for row in monthly_students)
+    monthly_recorded = sum(row["recorded_days"] for row in monthly_students)
+    month_names = (
+        "January", "February", "March", "April", "May", "June", "July",
+        "August", "September", "October", "November", "December",
+    )
+    monthly_export = _attendance_report_export_url(
+        "monthly", {"month": str(month), "year": str(year)}, filters,
+    )
+    monthly_panel = (
+        f'<section class="panel"><h2>Monthly attendance · {month_names[month - 1]} {year}</h2>' +
+        filter_form(
+            "monthly",
+            '<label>Month<select name="month">' + "".join(
+                f'<option value="{index}"{" selected" if index == month else ""}>'
+                f'{name}</option>'
+                for index, name in enumerate(month_names, 1)
+            ) + '</select></label><label>Year<input type="number" name="year" '
+            f'min="2000" max="2100" value="{year}"></label>',
+            "Load monthly report",
+        ) +
+        f'<div class="cards"><section class="card"><div class="label">Present days</div>'
+        f'<div class="value">{monthly_present}</div></section>'
+        f'<section class="card"><div class="label">Absent days</div>'
+        f'<div class="value">{monthly_absent}</div></section>'
+        f'<section class="card"><div class="label">Leave days</div>'
+        f'<div class="value">{monthly_leave}</div></section>'
+        f'<section class="card"><div class="label">Recorded student-days</div>'
+        f'<div class="value">{monthly_recorded}</div></section></div>'
+        f'<p><a class="button" href="{html.escape(monthly_export, quote=True)}">'
+        'Export monthly CSV</a></p><h3>Student attendance summary</h3>' +
+        _attendance_report_table(
+            ["Student", "Admission no.", "Class", "Section", "Recorded days",
+             "Present", "Absent", "Leave", "Late", "Attendance"],
+            [
+                (
+                    row["full_name"], row["admission_number"], row["class_name"],
+                    row["section_name"], row["recorded_days"],
+                    row["present_days"] or 0, row["absent_days"] or 0,
+                    row["leave_days"] or 0, row["late_days"] or 0,
+                    f"{(row['present_days'] or 0) * 100 / row['recorded_days']:.1f}%"
+                    if row["recorded_days"] else "0.0%",
+                )
+                for row in monthly_students
+            ],
+        ) + '<h3>Class-wise average attendance</h3>' +
+        _attendance_report_table(
+            ["Class", "Section", "Active students", "Recorded student-days",
+             "Present", "Absent", "Leave", "Attendance"],
+            [
+                (
+                    row["class_name"], row["section_name"], row["active_students"],
+                    row["recorded_days"], row["present_days"] or 0,
+                    row["absent_days"] or 0, row["leave_days"] or 0,
+                    f"{(row['present_days'] or 0) * 100 / row['recorded_days']:.1f}%"
+                    if row["recorded_days"] else "0.0%",
+                )
+                for row in monthly_classes
+            ],
+        ) + "</section>"
+    )
+
+    threshold_text = params.get("threshold", ["75"])[0].strip()
+    try:
+        threshold = float(threshold_text)
+        if not 0 <= threshold <= 100:
+            raise ValueError
+    except ValueError as error:
+        raise ValueError("Attendance threshold must be between 0 and 100.") from error
+    low_rows = [
+        row for row in _attendance_student_report_rows(db, user, filters)
+        if row["recorded_days"]
+        and (row["present_days"] or 0) * 100 / row["recorded_days"] < threshold
+    ]
+    low_export = _attendance_report_export_url(
+        "low-attendance", {"threshold": threshold_text}, filters,
+    )
+    low_panel = (
+        '<section class="panel"><h2>Low attendance alerts</h2>'
+        '<p class="sub">Administrative report only; no student records or notifications are changed.</p>' +
+        filter_form(
+            "low-attendance",
+            '<label>Threshold (%)<input type="number" name="threshold" min="0" '
+            'max="100" step="0.1" value="' + html.escape(threshold_text) + '"></label>',
+            "Apply alert threshold",
+        ) +
+        f'<p>Showing students below {threshold:g}% attendance.</p>'
+        f'<p><a class="button" href="{html.escape(low_export, quote=True)}">'
+        'Export low-attendance CSV</a></p>' +
+        _attendance_report_table(
+            ["Student", "Admission no.", "Class", "Section", "Attendance", "Absent days"],
+            [
+                (
+                    row["full_name"], row["admission_number"], row["class_name"],
+                    row["section_name"],
+                    f"{(row['present_days'] or 0) * 100 / row['recorded_days']:.1f}%",
+                    row["absent_days"] or 0,
+                )
+                for row in low_rows
+            ],
+        ) + "</section>"
+    )
+    return (
+        '<main><div class="dashboard-head"><div><p class="eyebrow">People & learning</p>'
+        '<h1>Attendance Reports &amp; Analytics</h1><p class="sub">'
+        'Recorded attendance only · percentages use present days divided by recorded days.'
+        '</p></div></div>' + student_panel + class_panel + monthly_panel + low_panel + "</main>"
+    )
+
+
+def attendance_report_csv(
+    db: sqlite3.Connection, user: sqlite3.Row, kind: str,
+    params: dict[str, list[str]],
+) -> tuple[str, list[str], list[tuple]]:
+    if user["role"] not in ADMIN_ROLES | {"Class Teacher"}:
+        raise PermissionError
+    filters = _attendance_report_filters(db, user, params)
+    if kind == "student-wise":
+        rows = _attendance_student_report_rows(
+            db, user, filters, params.get("q", [""])[0].strip(),
+        )
+        return (
+            "attendance-student-wise.csv",
+            ["Student", "Admission number", "Class", "Section", "Recorded days",
+             "Present days", "Absent days", "Leave days", "Late days",
+             "Attendance percentage"],
+            [
+                (
+                    row["full_name"], row["admission_number"], row["class_name"],
+                    row["section_name"], row["recorded_days"],
+                    row["present_days"] or 0, row["absent_days"] or 0,
+                    row["leave_days"] or 0, row["late_days"] or 0,
+                    f"{(row['present_days'] or 0) * 100 / row['recorded_days']:.1f}"
+                    if row["recorded_days"] else "0.0",
+                )
+                for row in rows
+            ],
+        )
+    if kind == "class-wise":
+        rows = _attendance_class_report_rows(db, user, filters)
+        return (
+            "attendance-class-wise.csv",
+            ["Class", "Section", "Active students", "Recorded student-days",
+             "Present records", "Absent records", "Leave records", "Late records",
+             "Attendance percentage"],
+            [
+                (
+                    row["class_name"], row["section_name"], row["active_students"],
+                    row["recorded_days"], row["present_days"] or 0,
+                    row["absent_days"] or 0, row["leave_days"] or 0,
+                    row["late_days"] or 0,
+                    f"{(row['present_days'] or 0) * 100 / row['recorded_days']:.1f}"
+                    if row["recorded_days"] else "0.0",
+                )
+                for row in rows
+            ],
+        )
+    if kind == "monthly":
+        try:
+            month = int(params.get("month", [""])[0])
+            year = int(params.get("year", [""])[0])
+            if not 1 <= month <= 12 or not 2000 <= year <= 2100:
+                raise ValueError
+        except ValueError as error:
+            raise ValueError("Choose a valid month and year.") from error
+        month_start = date(year, month, 1)
+        month_end = date(year + (month == 12), month % 12 + 1, 1) - timedelta(days=1)
+        monthly_filters = {
+            **filters, "start_date": month_start, "end_date": month_end,
+        }
+        rows = _attendance_student_report_rows(db, user, monthly_filters)
+        return (
+            f"attendance-monthly-{year}-{month:02d}.csv",
+            ["Month", "Year", "Student", "Admission number", "Class", "Section",
+             "Recorded days", "Present days", "Absent days", "Leave days",
+             "Late days", "Attendance percentage"],
+            [
+                (
+                    month, year, row["full_name"], row["admission_number"],
+                    row["class_name"], row["section_name"], row["recorded_days"],
+                    row["present_days"] or 0, row["absent_days"] or 0,
+                    row["leave_days"] or 0, row["late_days"] or 0,
+                    f"{(row['present_days'] or 0) * 100 / row['recorded_days']:.1f}"
+                    if row["recorded_days"] else "0.0",
+                )
+                for row in rows
+            ],
+        )
+    if kind == "low-attendance":
+        try:
+            threshold = float(params.get("threshold", ["75"])[0])
+            if not 0 <= threshold <= 100:
+                raise ValueError
+        except ValueError as error:
+            raise ValueError(
+                "Attendance threshold must be between 0 and 100."
+            ) from error
+        rows = [
+            row for row in _attendance_student_report_rows(db, user, filters)
+            if row["recorded_days"]
+            and (row["present_days"] or 0) * 100 / row["recorded_days"] < threshold
+        ]
+        return (
+            "attendance-low-attendance.csv",
+            ["Student", "Admission number", "Class", "Section",
+             "Attendance percentage", "Absent days"],
+            [
+                (
+                    row["full_name"], row["admission_number"], row["class_name"],
+                    row["section_name"],
+                    f"{(row['present_days'] or 0) * 100 / row['recorded_days']:.1f}",
+                    row["absent_days"] or 0,
+                )
+                for row in rows
+            ],
+        )
+    raise ValueError("Unknown attendance export.")
+
+
 def module_page(db: sqlite3.Connection, page: str, user: sqlite3.Row,
                 params: dict[str, list[str]] | None = None) -> str:
     if not can_access_module(user, page):
@@ -1826,6 +2431,8 @@ def module_page(db: sqlite3.Connection, page: str, user: sqlite3.Row,
     params = params or {}
     if page == "attendance":
         return attendance_page(db, user, params)
+    if page == "attendance_reports":
+        return attendance_reports_page(db, user, params)
     config = {
         "students": (
             "Students", "Student records across Nursery to Class XII.",
@@ -3094,6 +3701,46 @@ class SchoolHandler(BaseHTTPRequestHandler):
         if path.path.startswith("/static/"):
             self.send_static(path.path)
             return
+        if path.path.startswith("/export/attendance/"):
+            user = self.user()
+            if not user:
+                self.redirect("/login")
+                return
+            if user["role"] not in ADMIN_ROLES | {"Class Teacher"}:
+                self.send_html(
+                    _page_start("Not authorized", "", user) +
+                    "<main><h1>Not authorized</h1></main>" + _page_end(), 403,
+                )
+                return
+            kind = path.path.removeprefix("/export/attendance/")
+            try:
+                with database_connection(self.database) as db:
+                    filename, headers, rows = attendance_report_csv(
+                        db, user, kind, parse_qs(path.query),
+                    )
+            except PermissionError:
+                self.send_html(
+                    _page_start("Not authorized", "", user) +
+                    "<main><h1>Not authorized</h1><p>This attendance scope is not available to your account.</p></main>" +
+                    _page_end(), 403,
+                )
+                return
+            except ValueError as error:
+                self.send_html(
+                    _page_start("Invalid report filter", "", user) +
+                    f"<main><h1>Invalid report filter</h1><p>{html.escape(str(error))}</p></main>" +
+                    _page_end(), 400,
+                )
+                return
+            except sqlite3.Error:
+                self.log_error("Database error while exporting attendance")
+                self.send_html(
+                    _page_start("Application error", "", user) +
+                    "<main><h1>Unable to export attendance</h1></main>" + _page_end(), 500,
+                )
+                return
+            self.send_csv(filename, headers, rows)
+            return
         if path.path in ("/export/reports", "/export/payments"):
             user = self.user()
             if not user:
@@ -3328,6 +3975,12 @@ Type <strong>RESET DEMO DATA</strong> to confirm. Your demo login will be retain
             body += '<div class="app-shell">' + _navigation(user, active_module)
             body += '<div class="workspace">' + content + "</div></div>"
             self.send_html(body + _page_end())
+        except ValueError as error:
+            self.send_html(
+                _page_start("Invalid report filter", "", user) +
+                f"<main><h1>Invalid report filter</h1><p>{html.escape(str(error))}</p></main>" +
+                _page_end(), 400,
+            )
         except PermissionError:
             self.send_html(
                 _page_start("Not authorized", "", user) +

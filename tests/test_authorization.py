@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.parse import urlencode
-from urllib.request import HTTPCookieProcessor, Request, build_opener
+from urllib.request import HTTPCookieProcessor, ProxyHandler, Request, build_opener
 
 import app
 from app import NAV_ITEMS, SchoolHandler
@@ -67,7 +67,9 @@ class AuthorizationTests(unittest.TestCase):
     def client(self, role):
         if role not in self.clients:
             credential = self.credentials[role]
-            opener = build_opener(HTTPCookieProcessor(CookieJar()))
+            opener = build_opener(
+                ProxyHandler({}), HTTPCookieProcessor(CookieJar())
+            )
             login = urlencode({
                 "email": credential["email"],
                 "password": credential["password"],
@@ -103,7 +105,7 @@ class AuthorizationTests(unittest.TestCase):
             db.close()
 
     def test_login_page_has_school_branding_accessible_fields_and_generic_error(self):
-        anonymous = build_opener()
+        anonymous = build_opener(ProxyHandler({}))
         page = anonymous.open(self.base_url + "/login", timeout=10).read().decode()
         self.assertIn('<main class="login-page"', page)
         self.assertIn(
@@ -159,6 +161,41 @@ class AuthorizationTests(unittest.TestCase):
         self.assertIn("The email address or password was not accepted.", error_page)
         self.assertIn("Welcome Back", error_page)
         self.assertNotIn("Sign in failed", error_page)
+
+    def test_successful_login_redirects_to_existing_dashboard_route(self):
+        credential = self.credentials["Director"]
+        opener = build_opener(
+            ProxyHandler({}), HTTPCookieProcessor(CookieJar())
+        )
+        login = urlencode({
+            "email": credential["email"],
+            "password": credential["password"],
+        }).encode()
+        response = opener.open(
+            Request(self.base_url + "/login", data=login), timeout=10
+        )
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.geturl(), self.base_url + "/")
+        self.assertIn("<h1>School overview</h1>", response.read().decode())
+
+    def test_authenticated_root_url_defaults_to_dashboard(self):
+        status, page = self.request("Director", "/")
+
+        self.assertEqual(status, 200)
+        self.assertIn("<h1>School overview</h1>", page)
+
+    def test_unauthenticated_dashboard_access_redirects_to_login(self):
+        for path in ("/", "/?page=dashboard"):
+            with self.subTest(path=path):
+                anonymous = build_opener(ProxyHandler({}))
+                response = anonymous.open(self.base_url + path, timeout=10)
+
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.geturl(), self.base_url + "/login")
+                page = response.read().decode()
+                self.assertIn("Sign in to access your dashboard", page)
+                self.assertNotIn("<h1>School overview</h1>", page)
 
     def test_shared_glass_system_is_used_across_application_modules(self):
         for path, module in (
@@ -630,6 +667,260 @@ class AuthorizationTests(unittest.TestCase):
         )
         db.commit()
         db.close()
+
+    def test_attendance_register_marks_all_statuses_and_updates_without_duplicates(self):
+        db = connect(self.database)
+        section = db.execute(
+            "SELECT section_id,class_name,section_name FROM class_sections "
+            "WHERE class_name='Nursery' ORDER BY section_name LIMIT 1"
+        ).fetchone()
+        roster = db.execute(
+            "SELECT student_id FROM students WHERE section_id=? AND status='Active' "
+            "ORDER BY roll_number",
+            (section["section_id"],),
+        ).fetchall()
+        db.close()
+        self.assertGreaterEqual(len(roster), 3)
+
+        attendance_date = "2099-01-15"
+        values = {
+            "section_id": section["section_id"],
+            "attendance_date": attendance_date,
+        }
+        for index, row in enumerate(roster):
+            values["status_" + row["student_id"]] = (
+                "Present", "Absent", "Late"
+            )[index % 3]
+        status, response = self.request("Principal", "/attendance/mark", values)
+        self.assertEqual(status, 200)
+        self.assertIn("Attendance saved successfully", response)
+
+        self.assertEqual(
+            self.db_value(
+                "SELECT COUNT(*) FROM attendance WHERE student_id IN "
+                "(SELECT student_id FROM students WHERE section_id=?) "
+                "AND attendance_date=?",
+                (section["section_id"], attendance_date),
+            ),
+            len(roster),
+        )
+        db = connect(self.database)
+        status_counts = {
+            row[0]: row[1] for row in db.execute(
+                "SELECT status,COUNT(*) FROM attendance "
+                "WHERE attendance_date=? GROUP BY status",
+                (attendance_date,),
+            )
+        }
+        db.close()
+        self.assertEqual(
+            status_counts,
+            {"Present": len(roster[::3]), "Absent": len(roster[1::3]), "Late": len(roster[2::3])},
+        )
+
+        values["status_" + roster[0]["student_id"]] = "Late"
+        self.assertEqual(self.request("Director", "/attendance/mark", values)[0], 200)
+        self.assertEqual(
+            self.db_value(
+                "SELECT COUNT(*) FROM attendance WHERE student_id=? AND attendance_date=?",
+                (roster[0]["student_id"], attendance_date),
+            ),
+            1,
+        )
+        self.assertEqual(
+            self.db_value(
+                "SELECT status FROM attendance WHERE student_id=? AND attendance_date=?",
+                (roster[0]["student_id"], attendance_date),
+            ),
+            "Late",
+        )
+        self.assertEqual(
+            self.db_value(
+                "SELECT COUNT(*) FROM attendance WHERE attendance_date=? "
+                "AND student_id IN (SELECT student_id FROM students WHERE section_id=?)",
+                (attendance_date, section["section_id"]),
+            ),
+            len(roster),
+        )
+        db = connect(self.database)
+        integrity_errors = db.execute("PRAGMA foreign_key_check").fetchall()
+        daily = db.execute(
+            "SELECT SUM(status IN ('Present','Late')),COUNT(*) FROM attendance "
+            "WHERE attendance_date=? AND student_id IN "
+            "(SELECT student_id FROM students WHERE section_id=?)",
+            (attendance_date, section["section_id"]),
+        ).fetchone()
+        history_totals = db.execute(
+            "SELECT COUNT(*),SUM(status IN ('Present','Late')) "
+            "FROM attendance WHERE student_id=?",
+            (roster[0]["student_id"],),
+        ).fetchone()
+        db.close()
+        self.assertEqual(integrity_errors, [])
+
+        page_path = (
+            "/?page=attendance&attendance_date=" + attendance_date +
+            "&class_name=" + section["class_name"] +
+            "&section_id=" + section["section_id"]
+        )
+        page_status, page = self.request("Director", page_path)
+        self.assertEqual(page_status, 200)
+        self.assertIn("Total students", page)
+        self.assertIn("Mark all present", page)
+        self.assertIn("Date-wise attendance overview", page)
+        self.assertIn("Absent students", page)
+        self.assertIn(f"{daily[0] * 100 / daily[1]:.1f}%", page)
+
+        absent_status, absent_page = self.request(
+            "Director",
+            "/?page=attendance&absent_date=" + attendance_date +
+            "&absent_class=" + section["class_name"] +
+            "&absent_section_id=" + section["section_id"],
+        )
+        self.assertEqual(absent_status, 200)
+        self.assertIn("Admission no.", absent_page)
+        self.assertIn("Absent", absent_page)
+
+        history_status, history_page = self.request(
+            "Director",
+            "/?page=attendance&history_student_id=" + roster[0]["student_id"] +
+            "&history_from=" + attendance_date + "&history_to=" + attendance_date,
+        )
+        self.assertEqual(history_status, 200)
+        self.assertIn("Overall attendance", history_page)
+        self.assertIn(attendance_date, history_page)
+        self.assertIn(
+            f"{history_totals[1] * 100 / history_totals[0]:.1f}%",
+            history_page,
+        )
+
+    def test_attendance_requires_valid_date_and_an_authorized_class_section(self):
+        db = connect(self.database)
+        section = db.execute(
+            "SELECT section_id FROM class_sections "
+            "WHERE homeroom_teacher_id <> (SELECT employee_id FROM demo_users "
+            "WHERE role='Class Teacher') LIMIT 1"
+        ).fetchone()
+        student = db.execute(
+            "SELECT student_id FROM students WHERE section_id=? AND status='Active' LIMIT 1",
+            (section["section_id"],),
+        ).fetchone()
+        db.close()
+        values = {
+            "section_id": section["section_id"],
+            "attendance_date": "2099-01-16",
+            "status_" + student["student_id"]: "Present",
+        }
+        self.assertEqual(
+            self.request("Class Teacher", "/attendance/mark", values)[0], 403
+        )
+        self.assertEqual(
+            self.request("Subject Teacher", "/attendance/mark", values)[0], 403
+        )
+        self.assertEqual(
+            self.request("Parent", "/attendance/mark", values)[0], 403
+        )
+        db = connect(self.database)
+        assigned_section = db.execute(
+            "SELECT section_id FROM class_sections WHERE homeroom_teacher_id=? LIMIT 1",
+            (
+                db.execute(
+                    "SELECT employee_id FROM demo_users WHERE role='Class Teacher'"
+                ).fetchone()[0],
+            ),
+        ).fetchone()
+        assigned_roster = db.execute(
+            "SELECT student_id FROM students WHERE section_id=? AND status='Active'",
+            (assigned_section["section_id"],),
+        ).fetchall()
+        db.close()
+        teacher_values = {
+            "section_id": assigned_section["section_id"],
+            "attendance_date": "2099-01-17",
+            **{
+                "status_" + row["student_id"]: "Present"
+                for row in assigned_roster
+            },
+        }
+        self.assertEqual(
+            self.request("Class Teacher", "/attendance/mark", teacher_values)[0],
+            200,
+        )
+        self.assertEqual(
+            self.db_value(
+                "SELECT COUNT(*) FROM attendance WHERE attendance_date='2099-01-17' "
+                "AND student_id IN (SELECT student_id FROM students WHERE section_id=?)",
+                (assigned_section["section_id"],),
+            ),
+            len(assigned_roster),
+        )
+        self.assertEqual(
+            self.request(
+                "Director", "/attendance/mark",
+                {**values, "attendance_date": "2099-02-30"},
+            )[0],
+            400,
+        )
+        self.assertEqual(
+            self.request(
+                "Director", "/attendance/mark",
+                {**values, "attendance_date": "20990116"},
+            )[0],
+            400,
+        )
+        self.assertEqual(
+            self.db_value(
+                "SELECT COUNT(*) FROM attendance WHERE attendance_date='2099-01-16'"
+            ),
+            0,
+        )
+
+    def test_attendance_page_scopes_history_and_handles_empty_sections(self):
+        db = connect(self.database)
+        db.execute(
+            "INSERT INTO class_sections "
+            "(section_id,class_name,section_name,academic_session,homeroom_teacher_id) "
+            "VALUES (?,?,?,?,?)",
+            ("empty-attendance-section", "Empty Class", "A", "2026-27", "demo-teacher-001"),
+        )
+        db.commit()
+        unrelated_student = db.execute(
+            "SELECT student_id FROM students WHERE student_id<>'demo-student-0001' LIMIT 1"
+        ).fetchone()[0]
+        db.close()
+        try:
+            empty_status, empty_page = self.request(
+                "Director",
+                "/?page=attendance&section_id=empty-attendance-section",
+            )
+            self.assertEqual(empty_status, 200)
+            self.assertIn("No active students in this section", empty_page)
+
+            parent_status, parent_page = self.request(
+                "Parent",
+                "/?page=attendance&history_student_id=" + unrelated_student,
+            )
+            self.assertEqual(parent_status, 200)
+            self.assertIn("not available to your account", parent_page)
+            self.assertNotIn(
+                "Student attendance history</h2><div class=\"profile-summary\">",
+                parent_page,
+            )
+
+            invalid_history_status, invalid_history = self.request(
+                "Director",
+                "/?page=attendance&history_student_id=demo-student-0001"
+                "&history_from=2099-02-30",
+            )
+            self.assertEqual(invalid_history_status, 200)
+            self.assertIn("Enter valid start and end dates", invalid_history)
+        finally:
+            db = connect(self.database)
+            db.execute(
+                "DELETE FROM class_sections WHERE section_id='empty-attendance-section'"
+            )
+            db.commit()
+            db.close()
 
     def test_student_crud_duplicate_prevention_and_persistence(self):
         status, add_page = self.request("Director", "/?page=students&action=add")
